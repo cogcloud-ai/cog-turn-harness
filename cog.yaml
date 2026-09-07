@@ -1,0 +1,50 @@
+schema: openteams/cog-manifest [0.1]
+id: openteams/cog-turn-harness
+version: 0.1.0
+summary: Runs one JSON interaction against an independently bound model.
+owner: trent@openteams.com
+license: BSD-3-Clause
+kind: context
+memory: none
+prohibits:
+- self_admission
+- credential_export
+- silent_model_substitution
+- external_tool_grants
+requires: []
+io:
+  accepts:
+  - harness_turn_request
+  - binding_request
+  produces:
+  - harness_turn_result
+  - candidate_binding
+extensions:
+  satisfier_binding:
+    contract: openteams/satisfier-binding [0.1-draft]
+    declaration: binding/provider.json
+interfaces:
+- name: turn
+  kind: command
+  task: turn
+  audience: usage
+  default: true
+- name: bind
+  kind: command
+  task: bind
+  audience: lifecycle
+- name: card
+  kind: command
+  task: card
+  audience: lifecycle
+- name: check
+  kind: command
+  task: check
+  audience: lifecycle
+- name: validate
+  kind: command
+  task: validate
+  audience: lifecycle
+evaluation:
+  tests:
+  - tests/test_provider.py

@@ -1,0 +1,18 @@
+[workspace]
+name = "cog-turn-harness"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = ">=3.11"
+pyyaml = "*"
+jsonschema = "*"
+
+[tasks]
+turn = "python src/turn_runtime.py turn"
+bind = "python src/turn_runtime.py bind"
+card = "python src/turn_runtime.py card"
+check = "python src/turn_runtime.py check"
+validate = "python src/turn_runtime.py validate"
+test = "python -m unittest discover -s tests -v"

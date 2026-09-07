@@ -1,0 +1,96 @@
+{
+  "document_kind": "binding",
+  "contract": "openteams/satisfier-binding [0.1-draft]",
+  "binding_id": "binding-author-model",
+  "revision": 1,
+  "state": "admitted",
+  "provider": {
+    "id": "openteams/cog-openrouter",
+    "version": "0.1.0"
+  },
+  "requirement_id": "author-inference",
+  "configuration": {
+    "model_id": "example/model-v1",
+    "allowed_upstreams": [
+      "example-upstream"
+    ],
+    "allow_provider_fallback": false
+  },
+  "credential_refs": {
+    "api_key": "credential:openrouter-personal"
+  },
+  "capability": "model-endpoint/openai-compatible",
+  "features": [
+    "text-generation",
+    "json-output"
+  ],
+  "composition": "model",
+  "model": {
+    "id": "example/model-v1",
+    "revision": null,
+    "digest": null
+  },
+  "harness": null,
+  "locality": "cloud",
+  "invocation": {
+    "protocol": "openai-chat-completions-v1",
+    "address": "https://model-access.example.invalid/v1"
+  },
+  "qualification": {
+    "level": "declaration",
+    "identity_verified": false,
+    "revision_pinned": false,
+    "evidence": [
+      {
+        "check": "feature-declaration",
+        "observation": "Illustrative provider declaration advertises text generation; no live probe performed."
+      }
+    ]
+  },
+  "admission": {
+    "resolver_id": "example-resolver",
+    "checks": [
+      {
+        "check": "correlation",
+        "passed": true,
+        "detail": "Package, configuration, references and request correlation match."
+      },
+      {
+        "check": "capability",
+        "passed": true,
+        "detail": "Capability and declared text-generation feature match; requirement accepts declaration evidence."
+      },
+      {
+        "check": "composition",
+        "passed": true,
+        "detail": "Model is explicitly allowed."
+      },
+      {
+        "check": "model",
+        "passed": true,
+        "detail": "Model identifier matches; immutable revision is not required."
+      },
+      {
+        "check": "locality-routing",
+        "passed": true,
+        "detail": "All illustrative allowed routes are cloud; cloud is permitted."
+      },
+      {
+        "check": "harness",
+        "passed": true,
+        "detail": "No inseparable agent harness declared."
+      },
+      {
+        "check": "invocation-authority",
+        "passed": true,
+        "detail": "Illustrative host supports the protocol and has the necessary grant; references contain no credentials."
+      },
+      {
+        "check": "verification",
+        "passed": true,
+        "detail": "Requirement does not demand identity verification or pinning; both remain false."
+      }
+    ]
+  },
+  "model_binding": null
+}

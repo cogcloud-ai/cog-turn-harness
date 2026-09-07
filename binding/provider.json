@@ -1,0 +1,72 @@
+{
+  "document_kind": "provider",
+  "contract": "openteams/satisfier-binding [0.1-draft]",
+  "provider": {
+    "id": "openteams/cog-turn-harness",
+    "version": "0.1.0"
+  },
+  "capability": "agentic-harness/chat",
+  "compositions": [
+    "harness"
+  ],
+  "binding_interface": "bind",
+  "configuration_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "memory_mode": {
+        "const": "none"
+      },
+      "tool_policy": {
+        "const": "no-tools"
+      },
+      "model_binding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "binding_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "binding_id",
+          "revision"
+        ]
+      }
+    },
+    "required": [
+      "memory_mode",
+      "tool_policy",
+      "model_binding"
+    ]
+  },
+  "credential_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {},
+    "required": []
+  },
+  "model_requirement": {
+    "id": "turn-model",
+    "capability": "model-endpoint/openai-compatible",
+    "accepted_compositions": [
+      "model"
+    ],
+    "features": [
+      "text-generation",
+      "json-output"
+    ],
+    "model_id": null,
+    "allowed_localities": [
+      "cloud"
+    ],
+    "evidence_level": "declaration",
+    "identity_verified": false,
+    "revision_pinned": false
+  }
+}

@@ -1,0 +1,7 @@
+.pixi/
+__pycache__/
+*.pyc
+state/
+runs/
+.env
+model.json

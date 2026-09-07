@@ -1,0 +1,10 @@
+{
+  "engine": "openai-compatible",
+  "harness_id": "openteams/json-turn-harness",
+  "features": [
+    "context/per-turn",
+    "memory/none",
+    "json-output",
+    "tools/none"
+  ]
+}

@@ -1,0 +1,1025 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:openteams:satisfier-binding:0.1-draft",
+  "title": "Configurable satisfier binding exchange (proposal)",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/provider"
+    },
+    {
+      "$ref": "#/$defs/bind_request"
+    },
+    {
+      "$ref": "#/$defs/bind_result"
+    },
+    {
+      "$ref": "#/$defs/binding"
+    },
+    {
+      "$ref": "#/$defs/harness_turn_request"
+    },
+    {
+      "$ref": "#/$defs/harness_turn_result"
+    }
+  ],
+  "$defs": {
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accepted_compositions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "model",
+              "model+harness",
+              "harness"
+            ]
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allowed_localities": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "local",
+              "cloud",
+              "customer-vpc"
+            ]
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "evidence_level": {
+          "enum": [
+            "declaration",
+            "probe"
+          ]
+        },
+        "identity_verified": {
+          "type": "boolean"
+        },
+        "revision_pinned": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "capability",
+        "accepted_compositions",
+        "features",
+        "model_id",
+        "allowed_localities",
+        "evidence_level",
+        "identity_verified",
+        "revision_pinned"
+      ]
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "document_kind": {
+          "const": "provider"
+        },
+        "contract": {
+          "const": "openteams/satisfier-binding [0.1-draft]"
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ]
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "compositions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "model",
+              "model+harness",
+              "harness"
+            ]
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "binding_interface": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configuration_schema": {
+          "type": "object"
+        },
+        "model_requirement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/requirement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credential_schema": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "document_kind",
+        "contract",
+        "provider",
+        "capability",
+        "compositions",
+        "binding_interface",
+        "configuration_schema",
+        "model_requirement",
+        "credential_schema"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "compositions": {
+                "contains": {
+                  "const": "harness"
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "compositions": {
+                "const": [
+                  "harness"
+                ]
+              },
+              "model_requirement": {
+                "type": "object",
+                "properties": {
+                  "accepted_compositions": {
+                    "const": [
+                      "model"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "model_requirement": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "bind_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "document_kind": {
+          "const": "bind_request"
+        },
+        "contract": {
+          "const": "openteams/satisfier-binding [0.1-draft]"
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ]
+        },
+        "requirement": {
+          "$ref": "#/$defs/requirement"
+        },
+        "configuration": {
+          "type": "object"
+        },
+        "credential_refs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "required": [
+        "document_kind",
+        "contract",
+        "request_id",
+        "binding_id",
+        "revision",
+        "provider",
+        "requirement",
+        "configuration",
+        "credential_refs"
+      ]
+    },
+    "bind_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "document_kind": {
+          "const": "bind_result"
+        },
+        "contract": {
+          "const": "openteams/satisfier-binding [0.1-draft]"
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "candidate",
+            "failed"
+          ]
+        },
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/binding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/problem"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "document_kind",
+        "contract",
+        "request_id",
+        "status",
+        "binding",
+        "problems"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "candidate"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "binding": {
+                "type": "object",
+                "properties": {
+                  "state": {
+                    "const": "candidate"
+                  }
+                }
+              },
+              "problems": {
+                "maxItems": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "binding": {
+                "type": "null"
+              },
+              "problems": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "document_kind": {
+          "const": "binding"
+        },
+        "contract": {
+          "const": "openteams/satisfier-binding [0.1-draft]"
+        },
+        "binding_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state": {
+          "enum": [
+            "candidate",
+            "admitted"
+          ]
+        },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ]
+        },
+        "requirement_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configuration": {
+          "type": "object"
+        },
+        "credential_refs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "composition": {
+          "enum": [
+            "model",
+            "model+harness",
+            "harness"
+          ]
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "revision": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "digest": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^sha256:[a-f0-9]{64}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "revision",
+                "digest"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "harness": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "version": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "configuration_digest": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^sha256:[a-f0-9]{64}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "version",
+                "configuration_digest"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "locality": {
+          "enum": [
+            "local",
+            "cloud",
+            "customer-vpc"
+          ]
+        },
+        "invocation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol": {
+              "enum": [
+                "openai-chat-completions-v1",
+                "cog-harness-turn-v1",
+                "cog-harness-turn-command-v1"
+              ]
+            },
+            "address": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "protocol",
+            "address"
+          ]
+        },
+        "qualification": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "level": {
+              "enum": [
+                "declaration",
+                "probe"
+              ]
+            },
+            "identity_verified": {
+              "type": "boolean"
+            },
+            "revision_pinned": {
+              "type": "boolean"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "check": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "observation": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "check",
+                  "observation"
+                ]
+              },
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "level",
+            "identity_verified",
+            "revision_pinned",
+            "evidence"
+          ]
+        },
+        "admission": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "resolver_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "check": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "passed": {
+                        "type": "boolean"
+                      },
+                      "detail": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "check",
+                      "passed",
+                      "detail"
+                    ]
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "required": [
+                "resolver_id",
+                "checks"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/binding_reference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "document_kind",
+        "contract",
+        "binding_id",
+        "revision",
+        "state",
+        "provider",
+        "requirement_id",
+        "configuration",
+        "credential_refs",
+        "capability",
+        "features",
+        "composition",
+        "model",
+        "harness",
+        "locality",
+        "invocation",
+        "qualification",
+        "admission",
+        "model_binding"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "composition": {
+                "const": "model"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "harness": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "harness": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "candidate"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "admission": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "admission": {
+                "type": "object",
+                "properties": {
+                  "checks": {
+                    "items": {
+                      "properties": {
+                        "passed": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "composition": {
+                "const": "harness"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "model": {
+                "type": "null"
+              },
+              "model_binding": {
+                "$ref": "#/$defs/binding_reference"
+              },
+              "invocation": {
+                "properties": {
+                  "protocol": {
+                    "enum": [
+                      "cog-harness-turn-v1",
+                      "cog-harness-turn-command-v1"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "model": {
+                "type": "object"
+              },
+              "model_binding": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "composition": {
+                "const": "model"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "invocation": {
+                "properties": {
+                  "protocol": {
+                    "const": "openai-chat-completions-v1"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "problem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "unsupported-contract",
+            "unsupported-interface",
+            "invalid-configuration",
+            "missing-credential",
+            "unauthorized",
+            "unsupported-model",
+            "incompatible-requirement",
+            "qualification-failed",
+            "provider-unavailable",
+            "quota-exceeded",
+            "identity-mismatch"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "code",
+        "detail"
+      ]
+    },
+    "binding_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "binding_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "binding_id",
+        "revision"
+      ]
+    },
+    "harness_turn_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "document_kind": {
+          "const": "harness_turn_request"
+        },
+        "contract": {
+          "const": "openteams/satisfier-binding [0.1-draft]"
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding": {
+          "$ref": "#/$defs/binding_reference"
+        },
+        "model_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/binding_reference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "consumer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ]
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "content": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "id",
+              "content"
+            ]
+          }
+        },
+        "task": {
+          "type": "object"
+        },
+        "tool_grant_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "thread_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "document_kind",
+        "contract",
+        "request_id",
+        "binding",
+        "model_binding",
+        "consumer",
+        "context",
+        "task",
+        "tool_grant_refs",
+        "thread_ref"
+      ]
+    },
+    "harness_turn_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "document_kind": {
+          "const": "harness_turn_result"
+        },
+        "contract": {
+          "const": "openteams/satisfier-binding [0.1-draft]"
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding": {
+          "$ref": "#/$defs/binding_reference"
+        },
+        "model_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/binding_reference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {},
+        "tool_uses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "tool": {
+                "type": "string",
+                "minLength": 1
+              },
+              "grant_ref": {
+                "type": "string",
+                "minLength": 1
+              },
+              "outcome": {
+                "enum": [
+                  "succeeded",
+                  "failed",
+                  "denied"
+                ]
+              }
+            },
+            "required": [
+              "tool",
+              "grant_ref",
+              "outcome"
+            ]
+          }
+        }
+      },
+      "required": [
+        "document_kind",
+        "contract",
+        "request_id",
+        "binding",
+        "model_binding",
+        "result",
+        "tool_uses"
+      ]
+    }
+  }
+}
