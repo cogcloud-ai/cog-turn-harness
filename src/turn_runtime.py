@@ -235,10 +235,14 @@ def infer_vendor(request, binding):
     strict = native_schema(schema)
     if not strict:
         prompt += '\n\nReturn only a JSON object conforming to this output schema:\n' + json.dumps(schema)
+    # Vendor strict-output parsers reject JSON Schema meta keys ('$schema', '$id')
+    # that authored Cogs legitimately carry; hand the vendor a bare copy. The
+    # full schema, meta keys included, still validates the result below.
+    vendor_schema = {k: v for k, v in schema.items() if k not in ('$schema', '$id')}
     with tempfile.TemporaryDirectory(prefix='cog-turn-') as directory:
         directory = Path(directory)
         schema_file = directory / 'output-schema.json'
-        schema_file.write_text(json.dumps(schema))
+        schema_file.write_text(json.dumps(vendor_schema))
         if engine == 'codex':
             result_file = directory / 'result.json'
             argv = [vendor_executable(), 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--skip-git-repo-check',
@@ -264,7 +268,7 @@ def infer_vendor(request, binding):
                     '--no-session-persistence', '--output-format', 'json',
                     '--model', binding['model']['id']]
             if strict:
-                argv += ['--json-schema', json.dumps(schema)]
+                argv += ['--json-schema', json.dumps(vendor_schema)]
             data = json.loads(command(argv, prompt, str(directory)))
             require(not data.get('is_error') and data.get('subtype') == 'success', 'Claude did not finish successfully.')
             require(not data.get('permission_denials'), 'Claude requested unsupported permissions.')

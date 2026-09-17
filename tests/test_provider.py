@@ -111,6 +111,25 @@ class ProviderTests(unittest.TestCase):
                 self.assertNotIn('--dangerously-skip-permissions',argv)
                 if engine=='codex':self.assertEqual(argv[argv.index('--sandbox')+1],'read-only')
                 else:self.assertEqual(argv[argv.index('--tools')+1],'')
+    def test_vendor_schema_drops_meta_keys(self):
+        # Authored Cogs carry '$schema'; the Claude CLI rejects it in --json-schema.
+        for engine in ('codex','claude'):
+            turn=copy.deepcopy(self.turn)
+            turn['task']['output_schema']={'$schema':'https://json-schema.org/draft/2020-12/schema','$id':'x',**turn['task']['output_schema']}
+            binding=copy.deepcopy(self.binding);binding['model']={'id':'synthetic-model','revision':None,'digest':None}
+            captured=[]
+            def command(argv,prompt,cwd):
+                if engine=='codex':
+                    captured.append(json.loads(Path(argv[argv.index('--output-schema')+1]).read_text()))
+                    Path(argv[argv.index('--output-last-message')+1]).write_text('{"ready":true}')
+                    return '{"type":"turn.completed"}\n'
+                captured.append(json.loads(argv[argv.index('--json-schema')+1]))
+                return json.dumps({'type':'result','subtype':'success','is_error':False,'result':json.dumps({'ready':True})})
+            with patch.dict(rt.ENGINE,{'engine':engine}),patch.object(rt,'doctor',return_value={'version':'test-cli 1'}),patch.object(rt,'vendor_executable',return_value='/fake/vendor'),patch.object(rt,'command',side_effect=command):
+                result,_=rt.infer_vendor(turn,binding)
+            self.assertEqual(result,{'ready':True})
+            handed=captured[0]
+            self.assertNotIn('$schema',handed);self.assertNotIn('$id',handed);self.assertEqual(handed['type'],'object')
     def test_vendor_version_change_requires_rebinding(self):
         binding=copy.deepcopy(self.binding);binding['model']={'id':'test'}
         with patch.object(rt,'doctor',return_value={'version':'new-cli'}),self.assertRaises(ValueError):rt.infer_vendor(self.turn,binding)
