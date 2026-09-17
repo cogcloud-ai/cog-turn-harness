@@ -60,7 +60,7 @@ def clean_env():
     return {k: v for k, v in os.environ.items() if k in keep}
 
 
-def command(argv, prompt=None, cwd=None, timeout=180, include_stderr=False):
+def command(argv, prompt=None, cwd=None, timeout=600, include_stderr=False):
     # File-backed capture bounds memory. Kill the whole process group on timeout.
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         try:
@@ -78,6 +78,10 @@ def command(argv, prompt=None, cwd=None, timeout=180, include_stderr=False):
         output.seek(0)
         data = output.read(MAX_BYTES + 1)
         require(len(data) <= MAX_BYTES, 'Vendor response exceeded the supported size.')
+        if not data.strip():
+            errors.seek(0)
+            tail = errors.read(MAX_BYTES).decode('utf-8', 'replace')[-800:].strip()
+            raise ValueError('Vendor CLI returned no output' + ('; stderr: ' + tail if tail else '.'))
         if include_stderr:
             errors.seek(0)
             data += errors.read(MAX_BYTES)
@@ -267,9 +271,30 @@ def infer_vendor(request, binding):
             observations['reported_model_usage'] = data.get('modelUsage', {})
             result = data.get('structured_output')
             if result is None:
-                result = json.loads(data['result'])
+                result = parse_result_text(data.get('result'))
         validate(result, schema=schema)
         return result, observations
+
+
+def parse_result_text(text):
+    """Model reply text -> JSON object. Tolerates a code fence or prose around
+    one object; anything else fails with an excerpt so the cause is visible."""
+    require(isinstance(text, str) and text.strip(), 'Vendor returned an empty result.')
+    body = text.strip()
+    if body.startswith('```'):
+        body = body.split('\n', 1)[1] if '\n' in body else ''
+        body = body.rsplit('```', 1)[0]
+    try:
+        return json.loads(body)
+    except ValueError:
+        pass
+    start, end = body.find('{'), body.rfind('}')
+    if start != -1 and end > start:
+        try:
+            return json.loads(body[start:end + 1])
+        except ValueError:
+            pass
+    raise ValueError('Vendor result was not a JSON object; it begins: ' + body[:200].replace('\n', ' '))
 
 
 def native_schema(schema):

@@ -52,7 +52,8 @@ a local host-authorized command, not an admission endpoint. Passing a file is
 not a security boundary against the same OS user. Use workbench's immutable
 store for correlation, package-change detection, revocation and provenance.
 The command adapter stays available through workbench; each vendor invocation
-is a fresh bounded process. There is no persistent hidden agent conversation.
+is a fresh bounded process. Subscription turns allow up to ten minutes for
+whole-source authoring; readiness checks retain their fifteen-second limits. There is no persistent hidden agent conversation.
 
 ## Contract and evidence
 
@@ -111,6 +112,6 @@ into the two subscription repositories. Update all copies together; the engine
 and provider declaration are package-specific. This keeps each Cog independently
 installable without requiring a sibling repository at runtime.
 
-Runtime SHA-256: `775454a22bb003d0f55b34633dbf2ac9df13214401db8eae0c3a07f2645cf0db`
+Runtime SHA-256: `f8ecf8215d2b153234a24d60f021c61a5d7a02a5b32825d36c7a20664b988849`
 
 Official integration references are in `docs/sources.md`.

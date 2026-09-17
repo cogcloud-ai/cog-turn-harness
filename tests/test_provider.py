@@ -21,6 +21,20 @@ class ProviderTests(unittest.TestCase):
             'task':{'input':'Test input','output_schema':{'type':'object','properties':{'ready':{'type':'boolean'}},'required':['ready'],'additionalProperties':False}},'tool_grant_refs':[],'thread_ref':None}
         model=json.loads((ROOT/'tests/model-binding.json').read_text())
         self.model=model if self.binding['composition']=='harness' else None
+    def test_timeout_rejects_partial_output(self):
+        with self.assertRaisesRegex(ValueError, 'timed out; no result accepted'):
+            rt.command([sys.executable, '-c', 'import time; print("partial", flush=True); time.sleep(10)'], timeout=0.05)
+    def test_result_text_tolerates_fences_and_prose(self):
+        self.assertEqual(rt.parse_result_text('{"ready": true}'),{'ready':True})
+        self.assertEqual(rt.parse_result_text('```json\n{"ready": true}\n```'),{'ready':True})
+        self.assertEqual(rt.parse_result_text('Here is the design:\n{"ready": true}\nLet me know.'),{'ready':True})
+        with self.assertRaisesRegex(ValueError,'not a JSON object; it begins: I could not'):
+            rt.parse_result_text('I could not produce a design because the goal is unclear.')
+        with self.assertRaisesRegex(ValueError,'empty result'):
+            rt.parse_result_text('')
+    def test_empty_vendor_output_reports_stderr(self):
+        with self.assertRaisesRegex(ValueError,'returned no output; stderr: boom'):
+            rt.command([sys.executable,'-c','import sys; sys.stderr.write("boom")'])
     def test_candidate_never_admits(self):
         value=rt.candidate(self.request,lambda:{'version':'test-cli 1'})
         self.assertEqual(value['binding']['state'],'candidate');self.assertIsNone(value['binding']['admission'])
@@ -71,7 +85,7 @@ class ProviderTests(unittest.TestCase):
         result=rt.envelope('turn',error='Vendor failed')
         self.assertFalse(result['ok']);self.assertIsNone(result['payload'])
     def test_vendored_schema_matches_profile(self):
-        profile=ROOT.parent/'cogspec/schemas/satisfier-binding.schema.json'
+        profile=ROOT.parent/'cog-manifest-openteams/schemas/satisfier-binding.schema.json'
         if profile.exists():self.assertEqual((ROOT/'contracts/satisfier-binding.schema.json').read_bytes(),profile.read_bytes())
 
 
