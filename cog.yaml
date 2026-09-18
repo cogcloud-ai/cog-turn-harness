@@ -29,6 +29,11 @@ interfaces:
   task: turn
   audience: usage
   default: true
+- name: serve
+  kind: web-api
+  task: serve
+  audience: usage
+  endpoint: http://127.0.0.1:8123/v1
 - name: bind
   kind: command
   task: bind
@@ -48,3 +53,4 @@ interfaces:
 evaluation:
   tests:
   - tests/test_provider.py
+  - tests/test_gateway.py

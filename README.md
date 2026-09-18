@@ -55,6 +55,58 @@ The command adapter stays available through workbench; each vendor invocation
 is a fresh bounded process. Subscription turns allow up to ten minutes for
 whole-source authoring; readiness checks retain their fifteen-second limits. There is no persistent hidden agent conversation.
 
+## Serving a turn as an endpoint
+
+A context Cog reaches its model through an OpenAI-compatible endpoint named in
+its `model.json`. This Cog exposes a turn, not an endpoint, so `src/turn_gateway.py`
+is a loopback shim that accepts one chat-completions call and performs exactly
+one turn in process.
+
+```sh
+pixi run serve -- --binding /path/to/admitted-binding.json
+pixi run serve -- --binding ../cog-workbench/var/suite/<hash>-<revision>.json --port 8123
+```
+
+`--binding` is an **admitted** binding document — either a bare document or a
+workbench suite entry carrying one under `binding`. The gateway refuses to start
+on anything else and names the reason. Add `--model-binding FILE` when the
+binding references a separately admitted model. The default port is 8123; the
+sibling providers default to 8121 (cog-claude) and 8122 (cog-chatgpt).
+
+The surface is `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`.
+The one model id served is `turn-harness/<binding_id>@<revision>`; a request naming
+another model is a 400. The system message and the user message become the
+turn's rendered `task.input` under plain headers, and `response_format` must be
+`json_schema` — its `schema` becomes the turn's `task.output_schema`.
+`json_object`, no `response_format`, `stream: true`, `tools` and `n > 1` are
+each a 400 whose message names what a turn does support. The reply's
+`choices[0].message.content` is the turn's result as JSON text, alongside an
+`x_cog` object carrying provider identity, the binding reference, the request
+id, the provider's observations, `model_identity_verified: false` and
+`evidence_scope: composed-system`.
+
+If `COG_TURN_GATEWAY_TOKEN` is set in the gateway's environment, a matching
+bearer token is required on every request. No tools, no thread, no memory —
+exactly the turn contract.
+
+Honestly:
+
+- **Loopback only.** The gateway binds `127.0.0.1` and refuses any other host by
+  name. It performs the turn with **the owner's own vendor login**. It is
+  **never a route for anyone else's subscription**.
+- **Model+Harness, not a model.** The vendor CLI wraps the turn in its own
+  harness, so this is a **Model+Harness composition**; the Cog's envelope names
+  the gateway's model id, **not a verified model**. Model identity is
+  unverified and reported as such.
+- **Restart after any rebind.** The gateway runs outside the workbench host, so
+  **revocation there does not reach a running gateway**. Binding documents are
+  read once at start (working rule 6).
+- **`temperature` and `max_tokens` are accepted and ignored.** A turn has no
+  sampling controls.
+- **Turns take tens of seconds.** One turn runs at a time; a second request
+  waits. A failed turn is a `502` carrying the provider's own error code in an
+  OpenAI-style `error` object — never a fabricated completion.
+
 ## Contract and evidence
 
 The binding draft's `composition` is `harness`. Both provider and harness
@@ -107,10 +159,13 @@ not apply; the dedicated provider tests validate the custom implementation.
 
 ## Source ownership
 
-`src/turn_runtime.py` is maintained in cog-turn-harness and copied byte-for-byte
-into the two subscription repositories. Update all copies together; the engine
-and provider declaration are package-specific. This keeps each Cog independently
-installable without requiring a sibling repository at runtime.
+`src/turn_runtime.py`, `src/turn_gateway.py` and `tests/test_gateway.py` are
+maintained in cog-turn-harness and copied byte-for-byte into the two
+subscription repositories. Update all copies together; the engine and provider
+declaration are package-specific. This keeps each Cog independently installable
+without requiring a sibling repository at runtime. `tests/test_gateway.py`
+enforces the gateway copy against whichever siblings are present, and skips when
+none are.
 
 Runtime SHA-256: `f8ecf8215d2b153234a24d60f021c61a5d7a02a5b32825d36c7a20664b988849`
 
