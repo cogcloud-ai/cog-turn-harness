@@ -18,6 +18,7 @@ import tempfile
 import urllib.request
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = json.loads((ROOT / 'engine.json').read_text())
@@ -26,6 +27,8 @@ SCHEMA = json.loads((ROOT / 'contracts/satisfier-binding.schema.json').read_text
 CONTRACT = CARD['contract']
 IDENTITY = CARD['provider']
 MAX_BYTES = 8 * 1024 * 1024
+VENDOR_SECONDS = 600
+MODEL_SECONDS = 180
 
 
 def require(condition, message):
@@ -41,7 +44,10 @@ def validate(value, definition=None, schema=None):
     if schema is None:
         schema = dict(SCHEMA, **{'$ref': '#/$defs/' + definition})
         schema.pop('oneOf', None)
-    errors = list(Draft202012Validator(schema).iter_errors(value))
+    try:
+        errors = list(Draft202012Validator(schema).iter_errors(value))
+    except SchemaError as exc:
+        raise ValueError('Schema is not a valid JSON Schema: ' + str(exc).split('\n')[0]) from None
     require(not errors, 'Contract validation failed: ' + (str(errors[0].json_path) if errors else ''))
 
 
@@ -60,7 +66,7 @@ def clean_env():
     return {k: v for k, v in os.environ.items() if k in keep}
 
 
-def command(argv, prompt=None, cwd=None, timeout=600, include_stderr=False):
+def command(argv, prompt=None, cwd=None, timeout=VENDOR_SECONDS, include_stderr=False):
     # File-backed capture bounds memory. Kill the whole process group on timeout.
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         try:
@@ -152,6 +158,38 @@ def candidate(request, inspect=doctor):
             'status': 'candidate', 'binding': binding, 'problems': []}
 
 
+def references_resolve(schema):
+    """Every `$ref` in the output schema must be a pointer that resolves inside
+    this document. A remote reference is unsupported; an unresolved local one
+    would otherwise survive schema checking, spend a turn, and only fail when
+    the result is validated."""
+    def resolves(pointer):
+        node = schema
+        for token in pointer[1:].split('/'):
+            if not token:
+                continue
+            token = token.replace('~1', '/').replace('~0', '~')
+            if isinstance(node, dict) and token in node:
+                node = node[token]
+            elif isinstance(node, list) and token.isdigit() and int(token) < len(node):
+                node = node[int(token)]
+            else:
+                return False
+        return True
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ('$ref', '$dynamicRef'):
+                    require(isinstance(value, str) and value.startswith('#'), 'Remote schema references are unsupported.')
+                    require(resolves(value), f'Output schema reference {value} does not resolve inside the schema.')
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(schema)
+
+
 def check_turn(request, binding, model_binding=None):
     validate(binding, 'binding')
     require(binding['state'] == 'admitted' and binding['provider'] == IDENTITY, 'An admitted binding for this provider is required.')
@@ -163,16 +201,12 @@ def check_turn(request, binding, model_binding=None):
     require(set(request['task']) == {'input', 'output_schema'}, 'Turn task requires input and output_schema only.')
     require(isinstance(request['task']['input'], str), 'Rendered task input must be text.')
     output_schema = request['task']['output_schema']
-    def local(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                require(k not in ('$ref', '$dynamicRef') or isinstance(v, str) and v.startswith('#'), 'Remote schema references are unsupported.')
-                local(v)
-        elif isinstance(node, list):
-            for v in node:
-                local(v)
-    local(output_schema)
-    Draft202012Validator.check_schema(output_schema)
+    require(isinstance(output_schema, dict), 'Object output schema required.')
+    references_resolve(output_schema)
+    try:
+        Draft202012Validator.check_schema(output_schema)
+    except SchemaError as exc:
+        raise ValueError('Output schema is not a valid JSON Schema: ' + str(exc).split('\n')[0]) from None
     require(output_schema.get('type') == 'object', 'Object output schema required.')
     if binding['composition'] == 'harness':
         validate(model_binding, 'binding')
@@ -188,7 +222,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def infer_model(request, model_binding):
+def infer_model(request, model_binding, timeout=None):
     from urllib.parse import urlsplit
     address = model_binding['invocation']['address']
     parsed = urlsplit(address)
@@ -206,7 +240,7 @@ def infer_model(request, model_binding):
     req = urllib.request.Request(address.rstrip('/') + '/chat/completions', json.dumps(body).encode(),
                                  {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
     try:
-        with urllib.request.build_opener(NoRedirect).open(req, timeout=180) as response:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=MODEL_SECONDS if timeout is None else timeout) as response:
             raw = response.read(MAX_BYTES + 1)
         require(len(raw) <= MAX_BYTES, 'Model response exceeded limit.')
         data = json.loads(raw)
@@ -222,8 +256,9 @@ def infer_model(request, model_binding):
     return result, {'gateway': facts}
 
 
-def infer_vendor(request, binding):
+def infer_vendor(request, binding, timeout=None):
     engine = ENGINE['engine']
+    timeout = VENDOR_SECONDS if timeout is None else timeout
     status = doctor()
     require(status['version'] == binding['harness']['version'], 'Vendor harness version changed; rebind before invoking.')
     prompt = '\n\n'.join(x['content'] for x in request['context']) + '\n\nTASK DATA:\n' + request['task']['input']
@@ -238,7 +273,7 @@ def infer_vendor(request, binding):
     # Vendor strict-output parsers reject JSON Schema meta keys ('$schema', '$id')
     # that authored Cogs legitimately carry; hand the vendor a bare copy. The
     # full schema, meta keys included, still validates the result below.
-    vendor_schema = {k: v for k, v in schema.items() if k not in ('$schema', '$id')}
+    vendor_schema = {k: v for k, v in schema.items() if k not in STRIPPED_KEYS}
     with tempfile.TemporaryDirectory(prefix='cog-turn-') as directory:
         directory = Path(directory)
         schema_file = directory / 'output-schema.json'
@@ -254,7 +289,7 @@ def infer_vendor(request, binding):
             for feature in ('shell_tool', 'apps', 'plugins', 'hooks', 'browser_use', 'computer_use', 'image_generation', 'multi_agent', 'memories', 'skill_search'):
                 argv += ['--disable', feature]
             argv += ['-']
-            events = command(argv, prompt, str(directory))
+            events = command(argv, prompt, str(directory), timeout=timeout)
             for line in events.splitlines():
                 event = json.loads(line)
                 require(event.get('type') != 'turn.failed', 'Vendor turn failed.')
@@ -269,7 +304,7 @@ def infer_vendor(request, binding):
                     '--model', binding['model']['id']]
             if strict:
                 argv += ['--json-schema', json.dumps(vendor_schema)]
-            data = json.loads(command(argv, prompt, str(directory)))
+            data = json.loads(command(argv, prompt, str(directory), timeout=timeout))
             require(not data.get('is_error') and data.get('subtype') == 'success', 'Claude did not finish successfully.')
             require(not data.get('permission_denials'), 'Claude requested unsupported permissions.')
             observations['reported_model_usage'] = data.get('modelUsage', {})
@@ -301,21 +336,44 @@ def parse_result_text(text):
     raise ValueError('Vendor result was not a JSON object; it begins: ' + body[:200].replace('\n', ' '))
 
 
-def native_schema(schema):
-    """Conservative vendor strict-schema subset; local checks remain normative."""
-    if isinstance(schema, dict):
-        if schema.get('type') == 'object':
-            if schema.get('additionalProperties') is not False or set(schema.get('required', [])) != set(schema.get('properties', {})):
-                return False
-        return all(native_schema(value) for value in schema.values())
-    if isinstance(schema, list):
-        return all(native_schema(value) for value in schema)
-    return True
+NATIVE_TYPES = {'object', 'array', 'string', 'integer', 'number', 'boolean'}
+NATIVE_KEYS = {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'description', 'title'}
+STRIPPED_KEYS = ('$schema', '$id')
 
 
-def turn(request, binding, model_binding=None):
+def native_schema(schema, top=True):
+    """The vendor strict structured-output subset, named exhaustively: a closed
+    tree of single-typed nodes built from the keys above and nothing else.
+    A `type` LIST, a nested meta key, a `$ref`, a combinator or any keyword not
+    enumerated here selects the prompt-based path instead — an honest prompt
+    beats a schema the vendor may reject or silently narrow. Local validation
+    against the full schema stays normative on both paths."""
+    if not isinstance(schema, dict):
+        return False
+    if set(schema) - ((NATIVE_KEYS | set(STRIPPED_KEYS)) if top else NATIVE_KEYS):
+        return False
+    kind = schema.get('type')
+    if not isinstance(kind, str) or kind not in NATIVE_TYPES:  # a type LIST included
+        return False
+    enum = schema.get('enum')
+    if 'enum' in schema and not (isinstance(enum, list) and enum
+                                 and all(isinstance(x, (str, int, float, bool)) for x in enum)):
+        return False
+    if kind == 'object':
+        properties = schema.get('properties')
+        return (isinstance(properties, dict) and bool(properties)
+                and schema.get('additionalProperties') is False
+                and set(schema.get('required') or []) == set(properties)
+                and all(native_schema(value, False) for value in properties.values()))
+    if kind == 'array':
+        return 'items' in schema and native_schema(schema['items'], False)
+    return 'properties' not in schema and 'items' not in schema
+
+
+def turn(request, binding, model_binding=None, timeout=None):
     check_turn(request, binding, model_binding)
-    result, observations = infer_model(request, model_binding) if ENGINE['engine'] == 'openai-compatible' else infer_vendor(request, binding)
+    result, observations = (infer_model(request, model_binding, timeout) if ENGINE['engine'] == 'openai-compatible'
+                            else infer_vendor(request, binding, timeout))
     payload = {'document_kind': 'harness_turn_result', 'contract': CONTRACT, 'request_id': request['request_id'],
                'binding': request['binding'], 'model_binding': request['model_binding'], 'result': result, 'tool_uses': []}
     validate(payload, 'harness_turn_result')

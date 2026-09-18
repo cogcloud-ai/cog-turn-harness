@@ -6,13 +6,19 @@ port. One chat completion becomes exactly one turn performed in this process:
 no tools, no thread, no memory, one at a time. The gateway never fabricates a
 completion — a failed turn is a 502 carrying the provider's own error code.
 
-It is not a route to anybody else's subscription: it binds 127.0.0.1 only and
-performs the turn with the vendor login of the user who started it.
+It is not a route to anybody else's subscription. It binds 127.0.0.1, it
+performs the turn with the vendor login of the user who started it, and — since
+a loopback port that spends a subscription is reachable from every page in this
+machine's browser — it refuses to start without a bearer token and refuses
+browser-shaped requests (a foreign Host, any Origin, a non-JSON body) before it
+looks at anything else.
 """
 import argparse
 import hmac
 import json
 import os
+import select
+import socket
 import sys
 import threading
 import time
@@ -28,8 +34,16 @@ LOOPBACK = '127.0.0.1'
 DEFAULT_PORTS = {'claude': 8121, 'codex': 8122, 'openai-compatible': 8123}
 SHORT_NAME = rt.IDENTITY['id'].rsplit('/', 1)[-1]
 SHORT_NAME = SHORT_NAME[4:] if SHORT_NAME.startswith('cog-') else SHORT_NAME
-CONSUMER = {'id': 'openteams/turn-gateway', 'version': '0.1.0'}
+CONSUMER = {'id': 'openteams/turn-gateway', 'version': '0.2.0'}
 MAX_BODY = 2 * 1024 * 1024
+MAX_CONNECTIONS = 8
+HEADER_SECONDS = 10      # installed before the request line is parsed
+BODY_SECONDS = 10        # a TOTAL upload deadline, not a per-packet one
+TURN_SECONDS = 170       # under the context-cog caller's 180 s
+QUEUE_SECONDS = 60       # how long a second request waits for the turn lock
+TOKEN_VARIABLE = 'COG_TURN_GATEWAY_TOKEN'
+TOKEN_LENGTH = 32
+CONTEXT_ID = 'system'
 # Accepted and ignored, as the docs say; a turn has no sampling controls.
 IGNORED_KEYS = {'temperature', 'max_tokens', 'max_completion_tokens'}
 REFUSED_KEYS = {'stream', 'n', 'tools', 'tool_choice', 'functions', 'function_call'}
@@ -37,6 +51,11 @@ SUPPORTED = ('A turn is one non-streaming request returning one JSON object: an 
              'optional system message followed by exactly one user message, '
              'response_format json_schema with an object schema, n = 1, no tools, '
              'no assistant history and no remembered thread.')
+
+
+def note(message):
+    """Operator log. No paths, bodies or completion text — request ids only."""
+    print('turn gateway: ' + message, file=sys.stderr, flush=True)
 
 
 class GatewayError(Exception):
@@ -91,7 +110,9 @@ def admitted_binding(path, label='--binding'):
 
 
 def prepare(binding_path, model_binding_path=None):
-    """Read the documents once, at start (working rule 6)."""
+    """Read the documents once, at start (working rule 6), and prove here that
+    the pair can actually serve a turn: a gateway that would answer 400 to every
+    completion because of its own configuration must refuse to start instead."""
     binding = admitted_binding(binding_path)
     refuse(binding['provider'] == rt.IDENTITY,
            f'--binding {binding_path}: binding belongs to provider '
@@ -113,6 +134,18 @@ def prepare(binding_path, model_binding_path=None):
                f'{model_binding["binding_id"]} revision {model_binding["revision"]}, '
                f'but the binding references {reference["binding_id"]} revision '
                f'{reference["revision"]}.')
+        refuse(model_binding['composition'] == 'model',
+               f'--model-binding {model_binding_path}: composition is '
+               f'{model_binding["composition"]!r}; a separately bound model must be '
+               f'model-only, or no turn this gateway accepts can be performed.')
+        refuse(model_binding['capability'] == 'model-endpoint/openai-compatible',
+               f'--model-binding {model_binding_path}: capability is '
+               f'{model_binding["capability"]!r}, not '
+               f'model-endpoint/openai-compatible.')
+        missing = {'text-generation', 'json-output'} - set(model_binding['features'])
+        refuse(not missing,
+               f'--model-binding {model_binding_path}: the admitted model does not '
+               f'declare {", ".join(sorted(missing))}; a turn needs both.')
     return binding, model_binding
 
 
@@ -120,14 +153,12 @@ def served_model(binding):
     return f'{SHORT_NAME}/{binding["binding_id"]}@{binding["revision"]}'
 
 
-def rendered_input(system, user):
-    parts = ([f'SYSTEM:\n{system}'] if system else []) + [f'USER:\n{user}']
-    return '\n\n'.join(parts)
-
-
 def translate(body, binding):
     """Chat-completions body -> harness_turn_request. Everything a turn cannot
-    do is a 400 that names what it supports."""
+    do is a 400 that names what it supports. System message contents become the
+    turn's `context` and the user message alone is `task.input`, so the provider
+    renders the workbench host's prompt shape: the instructions, then
+    `TASK DATA:`, then the data. Nothing reaches a vendor until this returns."""
     bad_request(isinstance(body, dict), 'Request body must be a JSON object.')
     unknown = set(body) - IGNORED_KEYS - REFUSED_KEYS - {'model', 'messages', 'response_format'}
     bad_request(not unknown, f'Unsupported request field(s): {", ".join(sorted(unknown))}.')
@@ -164,27 +195,61 @@ def translate(body, binding):
     bad_request(fmt.get('type') == 'json_schema',
                 f'response_format {fmt.get("type")!r} is not supported; a turn '
                 f'needs the object schema its result is validated against.')
-    schema = (fmt.get('json_schema') or {}).get('schema')
+    declaration = fmt.get('json_schema')
+    bad_request(isinstance(declaration, dict),
+                'response_format.json_schema must be an object carrying the schema.')
+    schema = declaration.get('schema')
     bad_request(isinstance(schema, dict), 'response_format.json_schema.schema must be an object schema.')
 
     return {'document_kind': 'harness_turn_request', 'contract': rt.CONTRACT,
             'request_id': str(uuid.uuid4()),
             'binding': {'binding_id': binding['binding_id'], 'revision': binding['revision']},
             'model_binding': binding['model_binding'], 'consumer': dict(CONSUMER),
-            'context': [], 'task': {'input': rendered_input(system, user), 'output_schema': schema},
+            'context': [{'id': CONTEXT_ID, 'content': system}] if system else [],
+            'task': {'input': user, 'output_schema': schema},
             'tool_grant_refs': [], 'thread_ref': None}
 
 
-def complete(body, binding, model_binding):
-    """One chat completion = one turn. Request faults are 400; turn faults are
-    502 with the provider's own error code, never a fabricated completion."""
+def validated(body, binding, model_binding):
+    """Translate and run every contract check BEFORE a turn lock is taken, so
+    nothing reaches the vendor — or waits in a queue — that cannot be served."""
     request = translate(body, binding)
     try:
         rt.check_turn(request, binding, model_binding)
-    except (ValueError, TypeError, KeyError) as exc:
-        raise GatewayError(400, 'unsupported_request', f'{exc} ' + SUPPORTED) from None
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+        detail = str(exc) if isinstance(exc, ValueError) else 'Request could not be checked against the turn contract.'
+        raise GatewayError(400, 'unsupported_request', f'{detail} ' + SUPPORTED) from None
+    return request
+
+
+def is_liveness_probe(body, binding):
+    """`cog_core.health(deep=True)` sends a one-token ping with no
+    response_format. That is a liveness question, not a turn: answer it here and
+    spend nothing. Documented as liveness — it proves the gateway and its
+    binding, never the vendor."""
+    return (isinstance(body, dict) and 'response_format' not in body
+            and not set(body) - {'model', 'messages', 'max_tokens', 'temperature'}
+            and isinstance(body.get('max_tokens'), int) and not isinstance(body.get('max_tokens'), bool)
+            and body['max_tokens'] == 1
+            and body.get('model', served_model(binding)) == served_model(binding))
+
+
+def pong(binding):
+    return {'id': 'chatcmpl-' + uuid.uuid4().hex, 'object': 'chat.completion',
+            'created': int(time.time()), 'model': served_model(binding),
+            'choices': [{'index': 0, 'finish_reason': 'stop',
+                         'message': {'role': 'assistant', 'content': 'pong'}}],
+            'x_cog': {'provider': rt.IDENTITY, 'liveness': True,
+                      'note': 'max_tokens 1 with no response_format is answered as '
+                              'liveness: no turn was performed and nothing was spent.',
+                      'model_identity_verified': False, 'evidence_scope': 'composed-system'}}
+
+
+def perform(request, binding, model_binding, timeout):
+    """One validated request = one turn. Turn faults are 502 with the provider's
+    own error code, never a fabricated completion."""
     try:
-        response = rt.turn(request, binding, model_binding)
+        response = rt.turn(request, binding, model_binding, timeout)
     except (ValueError, OSError, TypeError, KeyError) as exc:
         detail = str(exc) if isinstance(exc, ValueError) else 'Invalid or unavailable local document.'
         response = rt.envelope('turn', error=detail)
@@ -205,50 +270,189 @@ def complete(body, binding, model_binding):
                       'evidence_scope': 'composed-system'}}
 
 
-def make_server(binding, model_binding=None, port=None, host=LOOPBACK):
-    """A loopback server for one binding. The bearer token, like the binding,
-    is read once here."""
+class Gateway(ThreadingHTTPServer):
+    """Bounded: a flood of half-open connections must not become a thread
+    apiece. Over the limit is an immediate 503, not a queued socket."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, handler, connections=None):
+        self.slots = threading.Semaphore(connections or MAX_CONNECTIONS)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            body = json.dumps(GatewayError(503, 'busy', 'The gateway is at its connection '
+                                           'limit; it serves one turn at a time.',
+                                           'api_error').body()).encode()
+            try:
+                request.settimeout(0.5)
+                request.recv(65536)  # drain, so closing is not a bare reset
+            except OSError:
+                pass
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
+                                b'Content-Type: application/json\r\nConnection: close\r\n'
+                                b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+            except OSError:
+                pass
+            return self.shutdown_request(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
+                turn_timeout=None, queue_wait=None, connections=None):
+    """A loopback server for one binding. The bearer token, like the binding, is
+    read once here — and it is mandatory: without it any page in a local browser
+    could spend this subscription."""
     refuse(host == LOOPBACK, f'--host {host}: the turn gateway binds {LOOPBACK} only. '
                              f'It is the owner\'s own vendor login, never a route for '
                              f'anyone else\'s subscription.')
+    token = (os.environ.get(TOKEN_VARIABLE) or '').strip()
+    refuse(len(token) >= TOKEN_LENGTH,
+           f'{TOKEN_VARIABLE} must be set to at least {TOKEN_LENGTH} characters before '
+           f'this gateway will start. A loopback port that spends a subscription is '
+           f'reachable from every page in this machine\'s browser, so every route — '
+           f'/health included — requires the bearer token. Generate one with '
+           f'`python -c "import secrets; print(secrets.token_urlsafe(32))"` and name it '
+           f'to callers with api_key_env.')
+    expected = ('Bearer ' + token).encode()
     model = served_model(binding)
-    token = os.environ.get('COG_TURN_GATEWAY_TOKEN') or None
+    turn_timeout = TURN_SECONDS if turn_timeout is None else turn_timeout
+    queue_wait = QUEUE_SECONDS if queue_wait is None else queue_wait
     one_turn = threading.Lock()
 
     class Requests(BaseHTTPRequestHandler):
+        # Installed by StreamRequestHandler.setup(), i.e. BEFORE the request
+        # line and headers are parsed: incomplete headers cannot hold a thread.
+        timeout = HEADER_SECONDS
+        answered = False
+
         def log_message(self, *args):
             pass  # No paths, bodies or completion text in access logs.
 
         def respond(self, status, value):
             data = json.dumps(value, allow_nan=False).encode()
+            self.answered = True  # set first: never a second response attempt
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
-        def authorize(self):
-            if token is not None and not hmac.compare_digest(
-                    self.headers.get('Authorization', ''), 'Bearer ' + token):
-                raise GatewayError(401, 'invalid_api_key',
-                                   'COG_TURN_GATEWAY_TOKEN is set; a matching bearer token is required.',
-                                   'authentication_error')
-
         def fail(self, exc):
-            self.respond(exc.status, exc.body())
+            if self.answered:
+                return
+            try:
+                self.respond(exc.status, exc.body())
+            except OSError:
+                self.close_connection = True
+
+        def guard(self):
+            """Browser-shaped requests are refused before anything else. A
+            simple cross-origin POST needs no preflight, and a rebound hostname
+            still reaches loopback, so neither CORS nor the bind address is the
+            authorization boundary — these three checks and the token are."""
+            allowed = (f'{LOOPBACK}:{self.server.server_port}',
+                       f'localhost:{self.server.server_port}')
+            hosts = self.headers.get_all('Host') or []
+            if len(hosts) != 1 or hosts[0].strip() not in allowed:
+                raise GatewayError(403, 'forbidden_host',
+                                   'Host must be exactly ' + ' or '.join(allowed) +
+                                   '. This gateway answers local programs on loopback only.',
+                                   'permission_error')
+            if self.headers.get('Origin') is not None:
+                raise GatewayError(403, 'forbidden_origin',
+                                   'A browser origin is never a caller here: this gateway '
+                                   'spends the owner\'s own subscription.', 'permission_error')
+            offered = self.headers.get('Authorization', '').encode('utf-8', 'replace')
+            if not hmac.compare_digest(offered, expected):
+                raise GatewayError(401, 'invalid_api_key',
+                                   f'Every route requires the bearer token the gateway was '
+                                   f'started with ({TOKEN_VARIABLE}).', 'authentication_error')
+
+        def read_body(self):
+            media = (self.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+            if media != 'application/json':
+                raise GatewayError(415, 'unsupported_media_type',
+                                   'POST requires Content-Type: application/json. A body a '
+                                   'browser may send without a CORS preflight is refused.')
+            if self.headers.get('Transfer-Encoding'):
+                raise GatewayError(400, 'unsupported_request',
+                                   'Chunked bodies are unsupported; send a Content-Length.')
+            declared = [x.strip() for x in (self.headers.get_all('Content-Length') or [])]
+            if len(declared) != 1 or not declared[0].isdigit():
+                raise GatewayError(400, 'unsupported_request',
+                                   'Exactly one numeric Content-Length header is required.')
+            length = int(declared[0])
+            if length == 0:
+                raise GatewayError(400, 'unsupported_request', 'A request body is required.')
+            if length > MAX_BODY:
+                raise GatewayError(413, 'request_too_large',
+                                   f'A request body of at most {MAX_BODY} bytes is supported.')
+            raw = self.read_exactly(length)
+            self.connection.settimeout(None)  # a turn takes tens of seconds
+            try:
+                return json.loads(raw)
+            except ValueError:
+                raise GatewayError(400, 'unsupported_request', 'Request body is not JSON.') from None
+
+        def read_exactly(self, length):
+            """A TOTAL upload deadline, not a per-packet one: a drip feed that
+            never idles longer than the socket timeout is still a 408."""
+            late = GatewayError(408, 'request_timeout',
+                                f'The request body did not arrive within {BODY_SECONDS} seconds.',
+                                'api_error')
+            deadline, chunks, read = time.monotonic() + BODY_SECONDS, [], 0
+            while read < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise late
+                self.connection.settimeout(remaining)
+                try:
+                    chunk = self.rfile.read(min(length - read, 65536))
+                except (TimeoutError, socket.timeout):
+                    raise late from None
+                if not chunk:
+                    raise GatewayError(400, 'unsupported_request',
+                                       'The request body ended before Content-Length bytes arrived.')
+                chunks.append(chunk)
+                read += len(chunk)
+            return b''.join(chunks)
+
+        def client_gone(self):
+            """Has the caller given up? A queued request whose client left must
+            not spend a turn on its way out."""
+            try:
+                ready, _, _ = select.select([self.connection], [], [], 0)
+                return bool(ready) and self.connection.recv(1, socket.MSG_PEEK) == b''
+            except OSError:
+                return True
 
         def do_GET(self):
+            self.answered = False
             try:
-                self.authorize()
-                if self.path.rstrip('/') == '/health':
+                self.guard()
+                path = self.path.rstrip('/')
+                if path == '/health':
                     return self.respond(200, {'status': 'ok', 'model': model,
                                               'note': 'Liveness only. A turn is attempted '
                                                       'when a completion is requested.'})
-                if self.path.rstrip('/') == '/v1/models':
+                if path == '/v1/models':
                     return self.respond(200, {'object': 'list', 'data': [
                         {'id': model, 'object': 'model', 'created': 0,
                          'owned_by': rt.IDENTITY['id']}]})
-                raise GatewayError(404, 'not_found', f'Unknown endpoint {self.path!r}; this '
+                raise GatewayError(404, 'not_found', f'Unknown endpoint {path!r}; this '
                                                      f'gateway serves /health, /v1/models and '
                                                      f'/v1/chat/completions.')
             except GatewayError as exc:
@@ -258,34 +462,53 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK):
                                        'api_error'))
 
         def do_POST(self):
+            self.answered = False
             try:
-                self.authorize()
+                self.guard()
                 if self.path.rstrip('/') != '/v1/chat/completions':
                     raise GatewayError(404, 'not_found', f'Unknown endpoint {self.path!r}; '
                                                          f'completions are at /v1/chat/completions.')
-                if self.headers.get('Transfer-Encoding'):
-                    raise GatewayError(400, 'unsupported_request', 'Chunked bodies are unsupported.')
-                length = int(self.headers.get('Content-Length') or 0)
-                if not 0 < length <= MAX_BODY:
-                    raise GatewayError(413, 'unsupported_request', 'Invalid request size.')
-                self.connection.settimeout(30)
-                raw = self.rfile.read(length)
-                self.connection.settimeout(None)  # A turn takes tens of seconds.
-                try:
-                    body = json.loads(raw)
-                except ValueError:
-                    raise GatewayError(400, 'unsupported_request', 'Request body is not JSON.') from None
-                with one_turn:  # One turn at a time; a second request waits.
-                    result = complete(body, binding, model_binding)
-                self.respond(200, result)
+                body = self.read_body()
+                if is_liveness_probe(body, binding):
+                    return self.respond(200, pong(binding))
+                request = validated(body, binding, model_binding)
+                self.complete(request)
             except GatewayError as exc:
                 self.fail(exc)
             except (OSError, ValueError, TypeError):
                 self.fail(GatewayError(503, 'gateway_unavailable', 'Gateway unavailable.',
                                        'api_error'))
 
-    return ThreadingHTTPServer((host, port if port is not None else
-                                DEFAULT_PORTS[rt.ENGINE['engine']]), Requests)
+        def complete(self, request):
+            """One turn at a time, with both ends of the wait bounded: the queue
+            gives up with a 503, and a caller that left is never spent on."""
+            if not one_turn.acquire(timeout=queue_wait):
+                raise GatewayError(503, 'busy', f'A turn is already running and the '
+                                                f'{queue_wait} s queue wait elapsed. This '
+                                                f'gateway performs one turn at a time.',
+                                   'api_error')
+            try:
+                if self.client_gone():
+                    return self.drop(request, 'left while queued; no turn was started')
+                result = perform(request, binding, model_binding, turn_timeout)
+            finally:
+                one_turn.release()
+            # The turn is already paid for. If the caller has gone, it is
+            # finished and discarded here — never a second response attempt.
+            if self.client_gone():
+                return self.drop(request, 'left during the turn; the completed result is discarded')
+            try:
+                self.respond(200, result)
+            except OSError:
+                self.drop(request, 'left during the turn; the completed result is discarded')
+
+        def drop(self, request, reason):
+            self.close_connection = True
+            self.answered = True
+            note(f'{request["request_id"]}: the caller {reason}.')
+
+    return Gateway((host, port if port is not None else DEFAULT_PORTS[rt.ENGINE['engine']]),
+                   Requests, connections)
 
 
 def main(argv=None):
@@ -296,16 +519,25 @@ def main(argv=None):
     parser.add_argument('--model-binding')
     parser.add_argument('--port', type=int, default=DEFAULT_PORTS[rt.ENGINE['engine']])
     parser.add_argument('--host', default=LOOPBACK)
+    parser.add_argument('--turn-timeout', type=float, default=TURN_SECONDS,
+                        help='seconds allowed for one vendor turn (default %(default)s, '
+                             'under the context-cog caller\'s 180 s)')
+    parser.add_argument('--queue-wait', type=float, default=QUEUE_SECONDS,
+                        help='seconds a second request waits for the turn lock before '
+                             '503 busy (default %(default)s)')
     args = parser.parse_args(argv)
     try:
+        refuse(args.turn_timeout > 0 and args.queue_wait > 0,
+               '--turn-timeout and --queue-wait must both be positive.')
         binding, model_binding = prepare(args.binding, args.model_binding)
-        server = make_server(binding, model_binding, args.port, args.host)
+        server = make_server(binding, model_binding, args.port, args.host,
+                             args.turn_timeout, args.queue_wait)
     except ValueError as exc:
         print('turn gateway refuses to start: ' + str(exc), file=sys.stderr)
         return 2
-    print(f'turn gateway on http://{LOOPBACK}:{server.server_port}/v1 serving '
-          f'{served_model(binding)} (one turn at a time; loopback only; '
-          f'restart after any rebind)', file=sys.stderr, flush=True)
+    note(f'on http://{LOOPBACK}:{server.server_port}/v1 serving {served_model(binding)} '
+         f'(one turn at a time, {args.turn_timeout:g} s each; bearer token required on '
+         f'every route; loopback only; restart after any rebind)')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

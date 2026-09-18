@@ -1,8 +1,17 @@
-"""Turn-gateway tests. No vendor CLI: `turn` is replaced everywhere."""
+"""Turn-gateway tests. No vendor CLI: `turn` is replaced everywhere.
+
+Three layers: what the gateway refuses to start on, the transport boundary
+(token, Host, Origin, media type, deadlines, connection limit, disconnects),
+and the REAL caller — `cog_core.invoke`/`health` from the context-cog package
+beside this one, driven against a live loopback server with the vendor replaced.
+"""
+import contextlib
 import copy
+import io
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import threading
@@ -17,6 +26,8 @@ import turn_runtime as rt
 import turn_gateway as gw
 
 SCHEMA={'type':'object','properties':{'answer':{'type':'string'}},'required':['answer'],'additionalProperties':False}
+TOKEN='test-token-0123456789abcdef0123456789abcdef'
+CALLER=ROOT.parent/'cog-issue-classifier'
 
 
 def admitted():
@@ -27,9 +38,10 @@ def admitted():
     return binding
 
 
-def fake_turn(result=None,observations=None):
-    def turn(request,binding,model_binding=None):
+def fake_turn(result=None,observations=None,before=None):
+    def turn(request,binding,model_binding=None,timeout=None):
         rt.check_turn(request,binding,model_binding)
+        if before is not None: before(request)
         payload={'document_kind':'harness_turn_result','contract':rt.CONTRACT,'request_id':request['request_id'],
                  'binding':request['binding'],'model_binding':request['model_binding'],
                  'result':result if result is not None else {'answer':'ok'},'tool_uses':[]}
@@ -39,11 +51,17 @@ def fake_turn(result=None,observations=None):
     return turn
 
 
-def call(base,path,body=None,token=None,method=None,timeout=30):
+def never_called(*args,**kwargs):
+    raise AssertionError('the vendor turn was reached by a request the gateway must refuse')
+
+
+def call(base,path,body=None,token=TOKEN,method=None,timeout=30,headers=None,
+         content_type='application/json'):
     data=json.dumps(body).encode() if body is not None else None
     request=urllib.request.Request(base+path,data=data,method=method,
-                                   headers={'Content-Type':'application/json'} if data else {})
+                                   headers={'Content-Type':content_type} if data else {})
     if token: request.add_header('Authorization','Bearer '+token)
+    for key,value in (headers or {}).items(): request.add_header(key,value)
     try:
         with urllib.request.urlopen(request,timeout=timeout) as response:
             return response.status,json.loads(response.read().decode())
@@ -51,10 +69,32 @@ def call(base,path,body=None,token=None,method=None,timeout=30):
         return exc.code,json.loads(exc.read().decode())
 
 
+def speak(port,payload,wait=5,hold=False):
+    """Raw HTTP, so the transport boundary can be tested without a client
+    library tidying it up. Returns (status, bytes), or (None, socket) when the
+    caller wants to keep the connection and walk away from it."""
+    sock=socket.create_connection(('127.0.0.1',port),timeout=wait)
+    sock.sendall(payload)
+    if hold: return None,sock
+    sock.settimeout(wait)
+    data=b''
+    try:
+        while True:
+            chunk=sock.recv(65536)
+            if not chunk: break
+            data+=chunk
+    except (TimeoutError,socket.timeout,ConnectionResetError):
+        pass
+    sock.close()
+    return (int(data.split(b' ')[1]) if data.startswith(b'HTTP/') else None),data
+
+
 class StartTests(unittest.TestCase):
     def setUp(self):
         self.binding=admitted()
         self.dir=tempfile.TemporaryDirectory();self.addCleanup(self.dir.cleanup)
+        self.env=patch.dict(os.environ,{gw.TOKEN_VARIABLE:TOKEN});self.env.start()
+        self.addCleanup(self.env.stop)
     def write(self,value,name='binding.json'):
         path=Path(self.dir.name)/name;path.write_text(json.dumps(value));return str(path)
     def dependency(self):
@@ -89,9 +129,30 @@ class StartTests(unittest.TestCase):
                 gw.prepare(self.write(self.binding),self.write(self.binding,'m.json'))
         else:
             with self.assertRaisesRegex(ValueError,'--model-binding is required'):gw.prepare(self.write(self.binding))
+    def test_incompatible_separate_model_refuses_to_start(self):
+        """A model binding that could never serve a turn is a start-time refusal,
+        not a 400 on every completion for the life of the process."""
+        if self.binding['model_binding'] is None:
+            self.skipTest('this provider is an inseparable Model+Harness binding')
+        model=json.loads((ROOT/'tests/model-binding.json').read_text())
+        # This provider's own binding, renumbered: a real document of the wrong
+        # composition, not a schema-invalid one.
+        wrong=copy.deepcopy(self.binding)
+        wrong['binding_id'],wrong['revision']=model['binding_id'],model['revision']
+        for broken,expected in ((wrong,'model-only'),
+                                (dict(model,capability='model-endpoint/other'),'capability is'),
+                                (dict(model,features=['text-generation']),'json-output')):
+            with self.assertRaisesRegex(ValueError,expected):
+                gw.prepare(self.write(self.binding),self.write(broken,'broken-model.json'))
     def test_non_loopback_host_refused_by_name(self):
         with self.assertRaisesRegex(ValueError,r'binds 127\.0\.0\.1 only'):
             gw.make_server(self.binding,None,0,'0.0.0.0')
+    def test_missing_or_short_token_refuses_to_start(self):
+        for value in (None,'','short-secret'):
+            with patch.dict(os.environ,{} if value is None else {gw.TOKEN_VARIABLE:value}):
+                if value is None: os.environ.pop(gw.TOKEN_VARIABLE,None)
+                with self.assertRaisesRegex(ValueError,'at least 32 characters'):
+                    gw.make_server(self.binding,None,0)
     def test_model_id_shape(self):
         self.assertEqual(gw.served_model(self.binding),
                          f'{gw.SHORT_NAME}/{self.binding["binding_id"]}@{self.binding["revision"]}')
@@ -100,16 +161,17 @@ class StartTests(unittest.TestCase):
 
 class ServerTestCase(unittest.TestCase):
     """A live loopback server on port 0, in a thread, with `turn` replaced."""
-    token=None
+    queue_wait=None
+    connections=None
     def setUp(self):
         self.binding=admitted()
         model=json.loads((ROOT/'tests/model-binding.json').read_text())
         self.model=model if self.binding['composition']=='harness' else None
-        environment={'COG_TURN_GATEWAY_TOKEN':self.token} if self.token else {}
-        with patch.dict(os.environ,environment,clear=False):
-            if not self.token: os.environ.pop('COG_TURN_GATEWAY_TOKEN',None)
-            self.server=gw.make_server(self.binding,self.model,0)
-        self.base=f'http://127.0.0.1:{self.server.server_port}'
+        with patch.dict(os.environ,{gw.TOKEN_VARIABLE:TOKEN}):
+            self.server=gw.make_server(self.binding,self.model,0,queue_wait=self.queue_wait,
+                                       connections=self.connections)
+        self.port=self.server.server_port
+        self.base=f'http://127.0.0.1:{self.port}'
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.addCleanup(self.stop)
         self.model_id=gw.served_model(self.binding)
@@ -121,6 +183,14 @@ class ServerTestCase(unittest.TestCase):
                           {'role':'user','content':'Reply with answer = ok'}],
               'response_format':{'type':'json_schema','json_schema':{'name':'cog_output','strict':True,'schema':SCHEMA}}}
         body.update(overrides);return body
+    def post(self,body=None,content_type='application/json',length=None,host=None,
+             token=TOKEN,path='/v1/chat/completions'):
+        raw=json.dumps(body).encode() if body is not None else b''
+        head=f'POST {path} HTTP/1.1\r\nHost: {host or "127.0.0.1:"+str(self.port)}\r\n'
+        if token: head+=f'Authorization: Bearer {token}\r\n'
+        head+=f'Content-Type: {content_type}\r\n'
+        head+=f'Content-Length: {len(raw) if length is None else length}\r\n\r\n'
+        return head.encode()+raw
 
 
 class SurfaceTests(ServerTestCase):
@@ -133,21 +203,9 @@ class SurfaceTests(ServerTestCase):
     def test_unknown_endpoint(self):
         self.assertEqual(call(self.base,'/v1/embeddings')[0],404)
         self.assertEqual(call(self.base,'/v1/embeddings',{})[0],404)
-    def test_cog_core_health_probes(self):
-        # cog_core.health() probes <base without /v1>/health, then <base>/models.
-        endpoint=self.base+'/v1'
-        probes=[endpoint.rstrip('/').rsplit('/v1',1)[0]+'/health',endpoint.rstrip('/')+'/models']
-        for probe in probes:
-            with urllib.request.urlopen(urllib.request.Request(probe),timeout=5) as response:
-                self.assertEqual(response.status,200)
-    def test_exact_cog_core_invoke_body(self):
-        # The literal body cog_core.invoke builds for a json_schema binding.
-        body={'model':self.model_id,'temperature':0,
-              'messages':[{'role':'system','content':'You classify issues.'},
-                          {'role':'user','content':'ISSUE: the build is broken'}],
-              'response_format':{'type':'json_schema','json_schema':{'name':'cog_output','strict':True,'schema':SCHEMA}}}
+    def test_completion_shape(self):
         with patch.object(rt,'turn',side_effect=fake_turn()):
-            status,reply=call(self.base,'/v1/chat/completions',body)
+            status,reply=call(self.base,'/v1/chat/completions',self.completion_body())
         self.assertEqual(status,200)
         self.assertEqual(reply['model'],self.model_id)
         self.assertEqual(json.loads(reply['choices'][0]['message']['content']),{'answer':'ok'})
@@ -157,37 +215,173 @@ class SurfaceTests(ServerTestCase):
         self.assertEqual(x['binding'],{'binding_id':self.binding['binding_id'],'revision':self.binding['revision']})
         self.assertFalse(x['model_identity_verified']);self.assertEqual(x['evidence_scope'],'composed-system')
         self.assertTrue(x['request_id']);self.assertIsNotNone(x['provider_observations'])
-    def test_system_and_user_become_the_task_input(self):
+    def test_system_becomes_context_and_the_user_message_is_the_task_input(self):
         seen={}
-        def turn(request,binding,model_binding=None):
+        def turn(request,binding,model_binding=None,timeout=None):
             seen.update(request);return fake_turn()(request,binding,model_binding)
         with patch.object(rt,'turn',side_effect=turn):
             call(self.base,'/v1/chat/completions',self.completion_body())
-        self.assertIn('Answer as JSON.',seen['task']['input'])
-        self.assertIn('Reply with answer = ok',seen['task']['input'])
-        self.assertLess(seen['task']['input'].index('Answer as JSON.'),
-                        seen['task']['input'].index('Reply with answer = ok'))
+        self.assertEqual(seen['context'],[{'id':gw.CONTEXT_ID,'content':'Answer as JSON.'}])
+        self.assertEqual(seen['task']['input'],'Reply with answer = ok')
         self.assertEqual(seen['task']['output_schema'],SCHEMA)
         self.assertEqual(seen['tool_grant_refs'],[]);self.assertIsNone(seen['thread_ref'])
+    def test_rendered_prompt_is_the_workbench_host_shape(self):
+        # infer_vendor renders context, then 'TASK DATA:', then the input —
+        # exactly what the workbench host sends for the same messages.
+        request=gw.translate(self.completion_body(),self.binding)
+        rendered='\n\n'.join(x['content'] for x in request['context'])+'\n\nTASK DATA:\n'+request['task']['input']
+        self.assertEqual(rendered,'Answer as JSON.\n\nTASK DATA:\nReply with answer = ok')
+    def test_turn_timeout_reaches_the_runtime(self):
+        seen={}
+        def turn(request,binding,model_binding=None,timeout=None):
+            seen['timeout']=timeout;return fake_turn()(request,binding,model_binding)
+        with patch.object(rt,'turn',side_effect=turn):
+            call(self.base,'/v1/chat/completions',self.completion_body())
+        self.assertEqual(seen['timeout'],gw.TURN_SECONDS)
     def test_temperature_and_max_tokens_are_ignored(self):
         with patch.object(rt,'turn',side_effect=fake_turn()):
             status,_=call(self.base,'/v1/chat/completions',self.completion_body(temperature=0.7,max_tokens=32))
         self.assertEqual(status,200)
+    def test_deep_health_probe_is_answered_without_a_turn(self):
+        with patch.object(rt,'turn',side_effect=never_called):
+            status,body=call(self.base,'/v1/chat/completions',
+                             {'model':self.model_id,'max_tokens':1,
+                              'messages':[{'role':'user','content':'ping'}]})
+        self.assertEqual(status,200)
+        self.assertEqual(body['model'],self.model_id)
+        self.assertEqual(body['choices'][0]['message']['content'],'pong')
+        self.assertTrue(body['x_cog']['liveness'])
+
+
+class TransportTests(ServerTestCase):
+    def test_every_route_requires_the_token(self):
+        for path in ('/health','/v1/models'):
+            self.assertEqual(call(self.base,path,token=None)[0],401)
+            self.assertEqual(call(self.base,path,token='wrong')[0],401)
+        with patch.object(rt,'turn',side_effect=never_called):
+            self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body(),token=None)[0],401)
+            self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body(),token='wrong')[0],401)
+    def test_matching_token_admitted(self):
+        self.assertEqual(call(self.base,'/health')[0],200)
+        self.assertEqual(call(self.base,'/v1/models')[0],200)
+        with patch.object(rt,'turn',side_effect=fake_turn()):
+            self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body())[0],200)
+    def test_foreign_host_header_is_403(self):
+        # A DNS-rebound name still reaches loopback; the Host is the check.
+        for host in ('rebound.example','127.0.0.1','evil.test:'+str(self.port)):
+            status,_=speak(self.port,f'GET /health HTTP/1.1\r\nHost: {host}\r\n'
+                                     f'Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n'.encode())
+            self.assertEqual(status,403,host)
+    def test_localhost_host_header_is_accepted(self):
+        status,_=speak(self.port,f'GET /health HTTP/1.1\r\nHost: localhost:{self.port}\r\n'
+                                 f'Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n'.encode())
+        self.assertEqual(status,200)
+    def test_any_origin_is_403(self):
+        with patch.object(rt,'turn',side_effect=never_called):
+            status,body=call(self.base,'/v1/chat/completions',self.completion_body(),
+                             headers={'Origin':'https://page.example'})
+        self.assertEqual(status,403);self.assertEqual(body['error']['code'],'forbidden_origin')
+        self.assertEqual(call(self.base,'/health',headers={'Origin':'null'})[0],403)
+    def test_non_json_content_type_is_refused(self):
+        # A simple cross-origin POST needs no preflight; text/plain is its shape.
+        with patch.object(rt,'turn',side_effect=never_called):
+            status,_=call(self.base,'/v1/chat/completions',self.completion_body(),
+                          content_type='text/plain')
+        self.assertEqual(status,415)
+    def test_bad_content_length_is_400(self):
+        with patch.object(rt,'turn',side_effect=never_called):
+            for header in ('abc','-1','12 34',''):
+                status,_=speak(self.port,self.post(self.completion_body(),length=header))
+                self.assertEqual(status,400,header)
+    def test_oversized_declared_body_is_413(self):
+        with patch.object(rt,'turn',side_effect=never_called):
+            status,_=speak(self.port,self.post(self.completion_body(),length=gw.MAX_BODY+1))
+        self.assertEqual(status,413)
+    def test_body_that_never_arrives_is_408(self):
+        with patch.object(gw,'BODY_SECONDS',0.5),patch.object(rt,'turn',side_effect=never_called):
+            head=self.post(length=4096)
+            status,_=speak(self.port,head+b'{"partial"',wait=5)
+        self.assertEqual(status,408)
+    def test_incomplete_headers_do_not_hold_a_thread(self):
+        with patch.dict(os.environ,{gw.TOKEN_VARIABLE:TOKEN}),patch.object(gw,'HEADER_SECONDS',0.5):
+            server=gw.make_server(self.binding,self.model,0)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        self.addCleanup(lambda:(server.shutdown(),thread.join(5),server.server_close()))
+        sock=socket.create_connection(('127.0.0.1',server.server_port),timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(b'GET /health HTTP/1.1\r\nHost: x')  # no terminator, ever
+        sock.settimeout(5)
+        started=time.monotonic()
+        self.assertEqual(sock.recv(65536),b'',"the header deadline must close a silent connection")
+        self.assertLess(time.monotonic()-started,4)
+
+
+class ConnectionLimitTests(ServerTestCase):
+    connections=1
+    def test_over_the_connection_limit_is_an_immediate_503(self):
+        holder=socket.create_connection(('127.0.0.1',self.port),timeout=5)
+        self.addCleanup(holder.close)
+        probe=(f'GET /health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'
+               f'Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n').encode()
+        deadline=time.monotonic()+5
+        status=None
+        while time.monotonic()<deadline:
+            status,_=speak(self.port,probe,wait=2)
+            if status==503: break
+            time.sleep(0.05)
+        self.assertEqual(status,503,'the connection limit must refuse rather than queue')
 
 
 class RefusalTests(ServerTestCase):
     def refused(self,**overrides):
-        with patch.object(rt,'turn',side_effect=fake_turn()):
+        """Every refusal is an error object, and the vendor is never reached."""
+        with patch.object(rt,'turn',side_effect=never_called):
             status,body=call(self.base,'/v1/chat/completions',self.completion_body(**overrides))
         self.assertEqual(status,400,body)
         self.assertIn('A turn is one non-streaming request',body['error']['message'])
+        self.assertEqual(body['error']['type'],'invalid_request_error')
         return body
     def test_json_object_response_format(self):
         self.refused(response_format={'type':'json_object'})
     def test_missing_response_format(self):
         body=self.completion_body();body.pop('response_format')
-        with patch.object(rt,'turn',side_effect=fake_turn()):
+        with patch.object(rt,'turn',side_effect=never_called):
             self.assertEqual(call(self.base,'/v1/chat/completions',body)[0],400)
+    def test_nested_response_format_types(self):
+        # `json_schema: "oops"` used to raise an uncaught AttributeError.
+        self.refused(response_format={'type':'json_schema','json_schema':'oops'})
+        self.refused(response_format={'type':'json_schema','json_schema':{'schema':'oops'}})
+        self.refused(response_format={'type':'json_schema','json_schema':{'name':'x'}})
+        self.refused(response_format=['json_schema'])
+    def test_invalid_schema_is_400_not_a_traceback(self):
+        # jsonschema raises SchemaError here, which is not a ValueError.
+        for schema in ({'type':'object','required':42},
+                       {'type':'object','properties':{'a':{'type':'nope'}},
+                        'required':['a'],'additionalProperties':False}):
+            self.refused(response_format={'type':'json_schema',
+                                          'json_schema':{'name':'x','strict':True,'schema':schema}})
+    def test_unresolved_local_reference_is_400(self):
+        self.refused(response_format={'type':'json_schema','json_schema':{'name':'x','strict':True,
+                     'schema':{'type':'object','properties':{'a':{'$ref':'#/$defs/missing'}},
+                               'required':['a'],'additionalProperties':False}}})
+    def test_resolved_local_reference_is_accepted(self):
+        schema={'type':'object','$defs':{'text':{'type':'string'}},
+                'properties':{'a':{'$ref':'#/$defs/text'}},'required':['a'],'additionalProperties':False}
+        with patch.object(rt,'turn',side_effect=fake_turn({'a':'ok'})):
+            status,_=call(self.base,'/v1/chat/completions',self.completion_body(
+                response_format={'type':'json_schema','json_schema':{'name':'x','strict':True,'schema':schema}}))
+        self.assertEqual(status,200)
+    def test_body_that_is_not_json(self):
+        with patch.object(rt,'turn',side_effect=never_called):
+            status,_=speak(self.port,self.post()+b'',wait=5)
+        self.assertEqual(status,400)
+        payload=b'not json'
+        head=(f'POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'
+              f'Authorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\n'
+              f'Content-Length: {len(payload)}\r\n\r\n').encode()
+        with patch.object(rt,'turn',side_effect=never_called):
+            status,_=speak(self.port,head+payload)
+        self.assertEqual(status,400)
     def test_stream_tools_and_n(self):
         self.refused(stream=True);self.refused(n=2)
         self.refused(tools=[{'type':'function','function':{'name':'x'}}])
@@ -199,7 +393,7 @@ class RefusalTests(ServerTestCase):
         body=self.refused(seed=7)
         self.assertIn('seed',body['error']['message'])
     def test_another_model_id(self):
-        with patch.object(rt,'turn',side_effect=fake_turn()):
+        with patch.object(rt,'turn',side_effect=never_called):
             status,body=call(self.base,'/v1/chat/completions',self.completion_body(model='gpt-4o'))
         self.assertEqual(status,400);self.assertEqual(body['error']['code'],'model_not_found')
     def test_non_object_output_schema(self):
@@ -209,7 +403,7 @@ class RefusalTests(ServerTestCase):
         self.refused(response_format={'type':'json_schema','json_schema':{'name':'x','strict':True,
                      'schema':{'type':'object','$ref':'https://example.com/s.json'}}})
     def test_failed_turn_is_502_never_a_completion(self):
-        def turn(request,binding,model_binding=None):
+        def turn(request,binding,model_binding=None,timeout=None):
             raise ValueError('Vendor harness version changed; rebind before invoking.')
         with patch.object(rt,'turn',side_effect=turn):
             status,body=call(self.base,'/v1/chat/completions',self.completion_body())
@@ -227,7 +421,7 @@ class SerializationTests(ServerTestCase):
     def test_one_turn_at_a_time(self):
         live,overlap=[],[]
         lock=threading.Lock()
-        def turn(request,binding,model_binding=None):
+        def turn(request,binding,model_binding=None,timeout=None):
             with lock:
                 live.append(1)
                 if len(live)>1: overlap.append(1)
@@ -244,32 +438,175 @@ class SerializationTests(ServerTestCase):
         self.assertFalse(overlap,'turns overlapped; the gateway must run one at a time')
 
 
-class TokenTests(ServerTestCase):
-    token='shared-secret'
-    def test_token_required_on_every_endpoint(self):
-        for path in ('/health','/v1/models'):
-            self.assertEqual(call(self.base,path)[0],401)
-        with patch.object(rt,'turn',side_effect=fake_turn()):
-            self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body())[0],401)
-            self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body(),token='wrong')[0],401)
-    def test_matching_token_admitted(self):
-        self.assertEqual(call(self.base,'/health',token=self.token)[0],200)
-        self.assertEqual(call(self.base,'/v1/models',token=self.token)[0],200)
-        with patch.object(rt,'turn',side_effect=fake_turn()):
-            self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body(),token=self.token)[0],200)
+class QueueTestCase(ServerTestCase):
+    def held_turn(self,release,started,calls):
+        """A turn that blocks until the test lets it go, so the second request
+        is genuinely waiting on the lock."""
+        def turn(request,binding,model_binding=None,timeout=None):
+            calls.append(request['request_id'])
+            started.set()
+            release.wait(20)
+            return fake_turn()(request,binding,model_binding)
+        return turn
+    def occupy(self,release,started,calls):
+        first=threading.Thread(target=lambda:call(self.base,'/v1/chat/completions',
+                                                  self.completion_body()),daemon=True)
+        first.start()
+        self.assertTrue(started.wait(10),'the first turn never started')
+        return first
+
+
+class QueueTests(QueueTestCase):
+    queue_wait=0.5
+    def test_a_full_queue_answers_503_busy(self):
+        release,started,calls=threading.Event(),threading.Event(),[]
+        with patch.object(rt,'turn',side_effect=self.held_turn(release,started,calls)):
+            first=self.occupy(release,started,calls)
+            status,body=call(self.base,'/v1/chat/completions',self.completion_body())
+            release.set();first.join(20)
+        self.assertEqual(status,503);self.assertEqual(body['error']['code'],'busy')
+        self.assertEqual(len(calls),1,'the refused request must not have started a turn')
+
+
+class AbandonedQueueTests(QueueTestCase):
+    queue_wait=30  # long: the caller leaving, not the deadline, must end this
+    def test_an_abandoned_queue_entry_never_spends_a_turn(self):
+        release,started,calls=threading.Event(),threading.Event(),[]
+        log=io.StringIO()
+        with patch.object(rt,'turn',side_effect=self.held_turn(release,started,calls)),\
+             contextlib.redirect_stderr(log):
+            first=self.occupy(release,started,calls)
+            # Queue a second request, then walk away before the lock frees.
+            _,waiting=speak(self.port,self.post(self.completion_body()),hold=True)
+            time.sleep(0.5)
+            waiting.close()
+            release.set();first.join(20)
+            time.sleep(0.5)
+        self.assertEqual(len(calls),1,'a caller that left while queued must not spend a turn')
+        self.assertIn('left while queued',log.getvalue())
+
+
+class DisconnectTests(ServerTestCase):
+    def test_a_turn_whose_caller_left_finishes_and_is_discarded(self):
+        started,finished=threading.Event(),threading.Event()
+        def turn(request,binding,model_binding=None,timeout=None):
+            started.set()
+            time.sleep(0.6)
+            response=fake_turn()(request,binding,model_binding)
+            finished.set()
+            return response
+        log=io.StringIO()
+        with patch.object(rt,'turn',side_effect=turn),contextlib.redirect_stderr(log):
+            _,sock=speak(self.port,self.post(self.completion_body()),hold=True)
+            self.assertTrue(started.wait(10))
+            sock.close()
+            self.assertTrue(finished.wait(10),'the paid-for turn must run to completion')
+            time.sleep(0.5)
+            # No second response is attempted, and the gateway still serves.
+            with patch.object(rt,'turn',side_effect=fake_turn()):
+                self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body())[0],200)
+        self.assertIn('discarded',log.getvalue())
+
+
+class CallerTests(ServerTestCase):
+    """The real context-cog caller, not a hand-copied request body."""
+    def setUp(self):
+        if not (CALLER/'src/cog_core.py').is_file():
+            self.skipTest(f'{CALLER.name} is not beside this package; the real-caller '
+                          f'path is unverified in this checkout')
+        sys.path.insert(0,str(CALLER/'src'))
+        try:
+            import cog_core
+        except ImportError as exc:                       # pragma: no cover
+            self.skipTest(f'{CALLER.name} could not be imported ({exc}); the real-caller '
+                          f'path is unverified in this environment')
+        self.core=cog_core
+        super().setUp()
+        # Its binding comes from model.json; point the module at this server.
+        for patcher in (patch.object(self.core,'ENDPOINT',self.base+'/v1'),
+                        patch.object(self.core,'MODEL',self.model_id),
+                        patch.object(self.core,'API_KEY',TOKEN),
+                        patch.object(self.core,'RESPONSE_FORMAT','json_schema'),
+                        patch.dict(self.core.RECORD,{'locality':'local'})):
+            patcher.start();self.addCleanup(patcher.stop)
+    def bundle(self):
+        return json.loads((CALLER/'examples/sample-bundle.json').read_text())
+    def example_result(self):
+        return json.loads((CALLER/'context/output-example.json').read_text())
+    def test_invoke_reaches_the_gateway_and_returns_an_envelope(self):
+        result=self.example_result()
+        with patch.object(rt,'turn',side_effect=fake_turn(result)):
+            envelope=self.core.invoke(self.bundle())
+        self.assertTrue(envelope['ok'],envelope.get('error'))
+        self.assertEqual(envelope['payload'],result)
+        self.assertFalse([p for p in envelope['problems'] if p['check']=='schema'],envelope['problems'])
+    def test_the_caller_sends_the_context_the_gateway_maps_to_the_turn(self):
+        seen={}
+        def turn(request,binding,model_binding=None,timeout=None):
+            seen.update(copy.deepcopy(request))
+            return fake_turn(self.example_result())(request,binding,model_binding)
+        with patch.object(rt,'turn',side_effect=turn):
+            self.core.invoke(self.bundle())
+        self.assertEqual([x['id'] for x in seen['context']],[gw.CONTEXT_ID])
+        self.assertEqual(seen['context'][0]['content'],self.core.load_context())
+        self.assertEqual(seen['task']['input'],
+                         self.core.task_logic.render_input(self.bundle()))
+        self.assertEqual(seen['task']['output_schema'],self.core.OUTPUT_SCHEMA)
+    def test_shallow_health_and_deep_health_both_answer(self):
+        ok,detail=self.core.health()
+        self.assertTrue(ok,detail)
+        with patch.object(rt,'turn',side_effect=never_called):
+            ok,detail=self.core.health(deep=True)
+        self.assertTrue(ok,detail)
+        self.assertIn('identity matches',detail)
+    def test_a_caller_without_the_token_is_refused(self):
+        with patch.object(self.core,'API_KEY',None):
+            ok,detail=self.core.health()
+            self.assertFalse(ok,detail)
+            with patch.object(rt,'turn',side_effect=never_called):
+                envelope=self.core.invoke(self.bundle())
+        self.assertFalse(envelope['ok'])
+        self.assertEqual(envelope['error']['code'],'model-unavailable')
+
+
+class NativeSchemaTests(unittest.TestCase):
+    """The conservative detector: outside the named subset, the prompt path."""
+    def test_the_closed_object_subset_is_native(self):
+        self.assertTrue(rt.native_schema(SCHEMA))
+        self.assertTrue(rt.native_schema({'$schema':'https://json-schema.org/draft/2020-12/schema',
+                                          **SCHEMA}))
+    def test_anything_outside_the_subset_is_not(self):
+        nested=lambda inner:{'type':'object','properties':{'a':inner},'required':['a'],
+                             'additionalProperties':False}
+        for schema in ({'type':'object'},
+                       {'type':['object','null']},
+                       nested({'type':['object','null']}),
+                       nested({'$schema':'https://json-schema.org/draft/2020-12/schema','type':'string'}),
+                       nested({'type':'object','properties':{'b':{'type':'string'}},'required':['b']}),
+                       nested({'anyOf':[{'type':'string'}]}),
+                       nested({'$ref':'#/$defs/x'}),
+                       nested({'type':'string','pattern':'^x'}),
+                       {'type':'object','$defs':{'x':{'type':'string'}},
+                        'properties':{'a':{'type':'string'}},'required':['a'],'additionalProperties':False}):
+            self.assertFalse(rt.native_schema(schema),schema)
 
 
 class CopyTests(unittest.TestCase):
     SIBLINGS=('cog-claude','cog-chatgpt','cog-turn-harness')
-    def test_gateway_is_byte_identical_across_providers(self):
-        mine=ROOT/'src/turn_gateway.py'
-        others=[ROOT.parent/name/'src/turn_gateway.py' for name in self.SIBLINGS]
-        others=[p for p in others if p.exists() and p.resolve()!=mine.resolve()]
-        if not others:
+    SHARED=('src/turn_gateway.py','src/turn_runtime.py','tests/test_gateway.py','tests/test_provider.py')
+    def test_shared_sources_are_byte_identical_across_providers(self):
+        checked=0
+        for name in self.SHARED:
+            mine=ROOT/name
+            for sibling in self.SIBLINGS:
+                other=ROOT.parent/sibling/name
+                if not other.exists() or other.resolve()==mine.resolve():
+                    continue
+                checked+=1
+                self.assertEqual(mine.read_bytes(),other.read_bytes(),
+                                 f'{other} differs; {name} is copied byte-for-byte')
+        if not checked:
             self.skipTest('no sibling provider packages beside this one')
-        for other in others:
-            self.assertEqual(mine.read_bytes(),other.read_bytes(),
-                             f'{other} differs; turn_gateway.py is copied byte-for-byte')
 
 
 if __name__=='__main__':unittest.main()

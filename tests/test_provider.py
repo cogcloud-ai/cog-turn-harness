@@ -96,7 +96,7 @@ class ProviderTests(unittest.TestCase):
                 if not strict:turn['task']['output_schema']={'type':'object'}
                 binding=copy.deepcopy(self.binding);binding['model']={'id':'synthetic-model','revision':None,'digest':None}
                 captured=[]
-                def command(argv,prompt,cwd):
+                def command(argv,prompt,cwd,timeout=None):
                     captured.append((argv,prompt))
                     if engine=='codex':
                         Path(argv[argv.index('--output-last-message')+1]).write_text('{"ready":true}')
@@ -118,7 +118,7 @@ class ProviderTests(unittest.TestCase):
             turn['task']['output_schema']={'$schema':'https://json-schema.org/draft/2020-12/schema','$id':'x',**turn['task']['output_schema']}
             binding=copy.deepcopy(self.binding);binding['model']={'id':'synthetic-model','revision':None,'digest':None}
             captured=[]
-            def command(argv,prompt,cwd):
+            def command(argv,prompt,cwd,timeout=None):
                 if engine=='codex':
                     captured.append(json.loads(Path(argv[argv.index('--output-schema')+1]).read_text()))
                     Path(argv[argv.index('--output-last-message')+1]).write_text('{"ready":true}')

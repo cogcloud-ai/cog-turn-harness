@@ -63,49 +63,95 @@ is a loopback shim that accepts one chat-completions call and performs exactly
 one turn in process.
 
 ```sh
+export COG_TURN_GATEWAY_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 pixi run serve -- --binding /path/to/admitted-binding.json
 pixi run serve -- --binding ../cog-workbench/var/suite/<hash>-<revision>.json --port 8123
 ```
 
+**The token is mandatory.** The gateway refuses to start unless
+`COG_TURN_GATEWAY_TOKEN` is set to at least 32 characters, and every route —
+`/health` included — requires `Authorization: Bearer <token>`. A loopback port
+that spends a subscription is reachable from every page in this machine's
+browser, and CORS does not stop a simple `POST` from being *sent*. Name the same
+variable to the calling Cog with `api_key_env` in its `model.json`.
+
 `--binding` is an **admitted** binding document — either a bare document or a
 workbench suite entry carrying one under `binding`. The gateway refuses to start
 on anything else and names the reason. Add `--model-binding FILE` when the
-binding references a separately admitted model. The default port is 8123; the
-sibling providers default to 8121 (cog-claude) and 8122 (cog-chatgpt).
+binding references a separately admitted model; a separate model binding that
+could never serve a turn (wrong composition or capability, or missing
+`text-generation`/`json-output`) is also a start-time refusal rather than a 400
+on every completion. The default port is 8123; the sibling providers default
+to 8121 (cog-claude) and 8122 (cog-chatgpt).
+
+Two deadlines are yours to set. `--turn-timeout` (default 170 s, deliberately
+under the context-cog caller's 180 s) is the time one turn is allowed, and it is
+passed to the vendor command. `--queue-wait` (default 60 s) is how long a second
+request waits for the turn lock before it is answered `503 busy`.
 
 The surface is `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`.
 The one model id served is `turn-harness/<binding_id>@<revision>`; a request naming
-another model is a 400. The system message and the user message become the
-turn's rendered `task.input` under plain headers, and `response_format` must be
-`json_schema` — its `schema` becomes the turn's `task.output_schema`.
-`json_object`, no `response_format`, `stream: true`, `tools` and `n > 1` are
-each a 400 whose message names what a turn does support. The reply's
-`choices[0].message.content` is the turn's result as JSON text, alongside an
-`x_cog` object carrying provider identity, the binding reference, the request
-id, the provider's observations, `model_identity_verified: false` and
-`evidence_scope: composed-system`.
+another model is a 400. **The system message becomes the turn's `context`, and
+the user message alone becomes `task.input`**, so the provider renders the same
+prompt the workbench host would: the instructions, then `TASK DATA:`, then the
+data. `response_format` must be `json_schema` — its `schema` becomes the turn's
+`task.output_schema`. `json_object`, no `response_format`, `stream: true`,
+`tools` and `n > 1` are each a 400 whose message names what a turn does support.
+The reply's `choices[0].message.content` is the turn's result as JSON text,
+alongside an `x_cog` object carrying provider identity, the binding reference,
+the request id, the provider's observations, `model_identity_verified: false`
+and `evidence_scope: composed-system`.
 
-If `COG_TURN_GATEWAY_TOKEN` is set in the gateway's environment, a matching
-bearer token is required on every request. No tools, no thread, no memory —
-exactly the turn contract.
+Every failure is an OpenAI-style `error` object — never a fabricated completion,
+never a dropped connection, and never a traceback:
+
+| Situation | Status |
+|---|---|
+| missing or wrong bearer token | 401 |
+| a `Host` that is not `127.0.0.1:<port>` or `localhost:<port>`, or any `Origin` header | 403 |
+| a `POST` body that is not `Content-Type: application/json` | 415 |
+| anything a turn does not support — including a nested `response_format` type, a schema `jsonschema` rejects, a `$ref` that does not resolve inside the schema, and a malformed `Content-Length` | 400 |
+| a declared body over 2 MiB | 413 |
+| a body that does not finish arriving within 10 s | 408 |
+| all 8 connection slots in use, or the queue wait elapsed | 503 |
+| the turn itself failed | 502, with the provider's own error code |
+
+Nothing reaches the vendor until the whole request has passed every one of these
+checks. Request headers must arrive within 10 s as well, so a half-open
+connection cannot hold a thread.
+
+One request is answered without a turn: a body with **no `response_format` and
+`max_tokens: 1`** is the deep-health ping `cog_core.health(deep=True)` sends, and
+it is answered `200` with a fixed `pong` completion. That is a **liveness**
+answer about the gateway and its binding — it proves nothing about the vendor,
+and it spends nothing.
 
 Honestly:
 
-- **Loopback only.** The gateway binds `127.0.0.1` and refuses any other host by
-  name. It performs the turn with **the owner's own vendor login**. It is
-  **never a route for anyone else's subscription**.
-- **Model+Harness, not a model.** The vendor CLI wraps the turn in its own
-  harness, so this is a **Model+Harness composition**; the Cog's envelope names
-  the gateway's model id, **not a verified model**. Model identity is
-  unverified and reported as such.
+- **Loopback, and a token on every route.** The gateway binds `127.0.0.1` and
+  refuses any other host by name; it refuses a `Host` header that is not
+  `127.0.0.1:<port>` or `localhost:<port>`, refuses any request carrying an
+  `Origin`, and requires the bearer token even on `/health`.
+- **Not a subscription, and not a model.** This engine has no vendor
+  subscription login and uses none. It is the packaged JSON turn harness over
+  **a separately bound model gateway**, called with that binding's own
+  credential reference (`OPENROUTER_COG_TOKEN`); `composition` is `harness`.
+  The Cog's envelope names the gateway's model id, **not a verified model** —
+  identity stays unverified and is reported as such. The `serve` endpoint is
+  therefore a harness in front of somebody's admitted model, not a way to
+  resell a vendor login.
+- **A caller that walks away is not spent on twice.** Before a queued request
+  starts a turn, the gateway checks its caller is still connected and drops it
+  if not. A turn whose caller leaves *while it runs* finishes, and its result is
+  **discarded and logged** — no second response is attempted.
 - **Restart after any rebind.** The gateway runs outside the workbench host, so
-  **revocation there does not reach a running gateway**. Binding documents are
-  read once at start (working rule 6).
+  **revocation there does not reach a running gateway**. Binding documents and
+  the token are read once at start (working rule 6).
 - **`temperature` and `max_tokens` are accepted and ignored.** A turn has no
   sampling controls.
 - **Turns take tens of seconds.** One turn runs at a time; a second request
-  waits. A failed turn is a `502` carrying the provider's own error code in an
-  OpenAI-style `error` object — never a fabricated completion.
+  waits, then gives up with a `503`. A failed turn is a `502` carrying the
+  provider's own error code, never a fabricated completion.
 
 ## Contract and evidence
 
@@ -144,7 +190,12 @@ independent model judgment.
 `pixi run test` is deterministic and uses fake vendor/process responses. It
 covers composition rejection, candidate/admitted separation, exact references,
 locality, feature and pinning constraints, credential filtering, context/schema
-checks, command controls, version changes and schema fallback. See the suite's
+checks, command controls, version changes and schema fallback. The gateway
+suite adds the transport boundary — mandatory token, Host allowlist, Origin,
+media type, header/body deadlines, connection limit, an abandoned queue entry
+and a caller that leaves mid-turn — and drives the REAL context-cog caller
+(`cog_core.invoke` and `health`) against a live loopback server with the vendor
+replaced, skipping with a message when no context Cog sits beside the package. See the suite's
 `docs/verification-2026-09-07.md` for live-test status. No live quality claim is
 made by these tests.
 
@@ -159,14 +210,19 @@ not apply; the dedicated provider tests validate the custom implementation.
 
 ## Source ownership
 
-`src/turn_runtime.py`, `src/turn_gateway.py` and `tests/test_gateway.py` are
-maintained in cog-turn-harness and copied byte-for-byte into the two
-subscription repositories. Update all copies together; the engine and provider
-declaration are package-specific. This keeps each Cog independently installable
-without requiring a sibling repository at runtime. `tests/test_gateway.py`
-enforces the gateway copy against whichever siblings are present, and skips when
-none are.
+`src/turn_runtime.py`, `src/turn_gateway.py`, `tests/test_gateway.py` and
+`tests/test_provider.py` are maintained in cog-turn-harness and copied
+byte-for-byte into the two subscription repositories. Update all copies
+together; the engine and provider declaration are package-specific. This keeps
+each Cog independently installable without requiring a sibling repository at
+runtime. `tests/test_gateway.py` enforces all four copies against whichever
+siblings are present, and skips when none are.
 
-Runtime SHA-256: `f8ecf8215d2b153234a24d60f021c61a5d7a02a5b32825d36c7a20664b988849`
+SHA-256 of the shared sources, for an integrity check from outside the package:
+
+- `src/turn_runtime.py` — `be73439df29b140861992215635e977cbd8c2711ee0fee3e3951430b4ea3192c`
+- `src/turn_gateway.py` — `efcd63f46a999364d102737d5c93c0697c11f5d44f14b6401292bb2faf39bae3`
+- `tests/test_gateway.py` — `11bc8b77506762c4683a7837d991dc14d42c0c27afbe4dca8ead898dbf20ae1f`
+- `tests/test_provider.py` — `371ea2025293e66aab08fdf9b91b6f5dc350e1534bfa4dc79f50b50a6f62a00a`
 
 Official integration references are in `docs/sources.md`.
