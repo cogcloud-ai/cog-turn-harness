@@ -160,16 +160,29 @@ class StartTests(unittest.TestCase):
 
 
 class ServerTestCase(unittest.TestCase):
-    """A live loopback server on port 0, in a thread, with `turn` replaced."""
+    """A live loopback server on port 0, in a thread, with `turn` replaced.
+
+    Every deadline is a constructor parameter, so a test that must wait one out
+    waits half a second rather than ten (or a hundred and seventy)."""
     queue_wait=None
     connections=None
+    turn_timeout=None
+    min_inference=None
+    header_seconds=None
+    body_seconds=None
+    write_seconds=None
     def setUp(self):
         self.binding=admitted()
         model=json.loads((ROOT/'tests/model-binding.json').read_text())
         self.model=model if self.binding['composition']=='harness' else None
         with patch.dict(os.environ,{gw.TOKEN_VARIABLE:TOKEN}):
             self.server=gw.make_server(self.binding,self.model,0,queue_wait=self.queue_wait,
-                                       connections=self.connections)
+                                       connections=self.connections,
+                                       turn_timeout=self.turn_timeout,
+                                       min_inference=self.min_inference,
+                                       header_seconds=self.header_seconds,
+                                       body_seconds=self.body_seconds,
+                                       write_seconds=self.write_seconds)
         self.port=self.server.server_port
         self.base=f'http://127.0.0.1:{self.port}'
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
@@ -231,13 +244,16 @@ class SurfaceTests(ServerTestCase):
         request=gw.translate(self.completion_body(),self.binding)
         rendered='\n\n'.join(x['content'] for x in request['context'])+'\n\nTASK DATA:\n'+request['task']['input']
         self.assertEqual(rendered,'Answer as JSON.\n\nTASK DATA:\nReply with answer = ok')
-    def test_turn_timeout_reaches_the_runtime(self):
+    def test_the_turn_gets_what_the_budget_leaves_and_no_more(self):
+        """Not the flag value: what remains of this request's own budget once
+        the transport and the queue have had their share."""
         seen={}
         def turn(request,binding,model_binding=None,timeout=None):
             seen['timeout']=timeout;return fake_turn()(request,binding,model_binding)
         with patch.object(rt,'turn',side_effect=turn):
             call(self.base,'/v1/chat/completions',self.completion_body())
-        self.assertEqual(seen['timeout'],gw.TURN_SECONDS)
+        self.assertLessEqual(seen['timeout'],gw.TURN_SECONDS)
+        self.assertGreater(seen['timeout'],gw.TURN_SECONDS-10)
     def test_temperature_and_max_tokens_are_ignored(self):
         with patch.object(rt,'turn',side_effect=fake_turn()):
             status,_=call(self.base,'/v1/chat/completions',self.completion_body(temperature=0.7,max_tokens=32))
@@ -297,23 +313,104 @@ class TransportTests(ServerTestCase):
         with patch.object(rt,'turn',side_effect=never_called):
             status,_=speak(self.port,self.post(self.completion_body(),length=gw.MAX_BODY+1))
         self.assertEqual(status,413)
-    def test_body_that_never_arrives_is_408(self):
-        with patch.object(gw,'BODY_SECONDS',0.5),patch.object(rt,'turn',side_effect=never_called):
-            head=self.post(length=4096)
-            status,_=speak(self.port,head+b'{"partial"',wait=5)
-        self.assertEqual(status,408)
-    def test_incomplete_headers_do_not_hold_a_thread(self):
-        with patch.dict(os.environ,{gw.TOKEN_VARIABLE:TOKEN}),patch.object(gw,'HEADER_SECONDS',0.5):
-            server=gw.make_server(self.binding,self.model,0)
-        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-        self.addCleanup(lambda:(server.shutdown(),thread.join(5),server.server_close()))
-        sock=socket.create_connection(('127.0.0.1',server.server_port),timeout=5)
-        self.addCleanup(sock.close)
-        sock.sendall(b'GET /health HTTP/1.1\r\nHost: x')  # no terminator, ever
-        sock.settimeout(5)
+    def test_duplicate_authorization_headers_are_400_in_either_order(self):
+        """One good and one bad credential is ambiguous, and must fail the same
+        way whichever came first — not be decided by header order."""
+        good,bad=f'Bearer {TOKEN}','Bearer wrong-credential'
+        for first,second in ((good,bad),(bad,good),(good,good)):
+            raw=(f'GET /health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'
+                 f'Authorization: {first}\r\nAuthorization: {second}\r\n'
+                 f'Connection: close\r\n\r\n').encode()
+            status,data=speak(self.port,raw)
+            self.assertEqual(status,400,(first,second))
+            self.assertIn(b'Exactly one Authorization header',data)
+    def test_an_unsupported_method_is_a_json_error_object(self):
+        raw=(f'PUT /health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'
+             f'Authorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n'
+             f'Connection: close\r\n\r\n').encode()
+        status,data=speak(self.port,raw)
+        self.assertEqual(status,501)
+        body=json.loads(data.split(b'\r\n\r\n',1)[1].decode())
+        self.assertEqual(body['error']['code'],'unsupported_method')
+        self.assertEqual(body['error']['type'],'api_error')
+        self.assertNotIn(b'<html>',data.lower())
+
+
+class Dripper:
+    """A client that never stops sending and never finishes: one byte every
+    `pause` seconds, for as long as the server will listen. No inactivity
+    timeout ever fires for it — only a TOTAL deadline ends it."""
+    def __init__(self,port,prefix,pause=0.2):
+        self.sock=socket.socket();self.sock.settimeout(5)
+        self.sock.connect(('127.0.0.1',port))
+        self.sock.sendall(prefix)
+        self.pause=pause
+        self.stopped=threading.Event()
+        self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start()
+    def run(self):
+        while not self.stopped.wait(self.pause):
+            try: self.sock.sendall(b'X')
+            except OSError: return
+    def collect(self,wait=10):
+        self.sock.settimeout(wait);data=b''
+        try:
+            while True:
+                chunk=self.sock.recv(65536)
+                if not chunk: break
+                data+=chunk
+        except (TimeoutError,socket.timeout,ConnectionResetError,BrokenPipeError):
+            pass
+        return data
+    def close(self):
+        self.stopped.set()
+        try: self.sock.close()
+        except OSError: pass
+
+
+class ReadDeadlineTests(ServerTestCase):
+    """A trickle is not idleness. Both read deadlines are totals."""
+    header_seconds=1.0
+    body_seconds=1.0
+    def test_a_dripping_header_block_is_cut_off_at_the_header_deadline(self):
+        dripper=Dripper(self.port,f'GET /health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'.encode())
+        self.addCleanup(dripper.close)
         started=time.monotonic()
-        self.assertEqual(sock.recv(65536),b'',"the header deadline must close a silent connection")
-        self.assertLess(time.monotonic()-started,4)
+        self.assertEqual(dripper.collect(wait=8),b'',
+                         'a client that never finishes its headers is closed, silently')
+        elapsed=time.monotonic()-started
+        self.assertGreater(elapsed,self.header_seconds*0.5,'closed before its deadline')
+        self.assertLess(elapsed,self.header_seconds+3,
+                        'the header deadline is a total, not a gap between bytes')
+    def test_a_dripping_body_is_408_at_the_body_deadline(self):
+        with patch.object(rt,'turn',side_effect=never_called):
+            dripper=Dripper(self.port,self.post(length=4096)+b'{"par')
+            self.addCleanup(dripper.close)
+            started=time.monotonic()
+            data=dripper.collect(wait=8)
+            elapsed=time.monotonic()-started
+        self.assertEqual(int(data.split(b' ')[1]),408,data[:80])
+        self.assertGreater(elapsed,self.body_seconds*0.5)
+        self.assertLess(elapsed,self.body_seconds+3)
+    def test_eight_drippers_do_not_starve_health_past_the_deadline(self):
+        """Every slot held by a trickling, unauthenticated client. /health is
+        refused while they hold them and answered once their deadline passes —
+        it is never waiting on their rhythm."""
+        drippers=[Dripper(self.port,f'GET /health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'.encode())
+                  for _ in range(gw.MAX_CONNECTIONS)]
+        for dripper in drippers: self.addCleanup(dripper.close)
+        probe=(f'GET /health HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\n'
+               f'Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n').encode()
+        self.assertEqual(speak(self.port,probe,wait=2)[0],503,
+                         'while every slot is held, /health is refused at once, never queued')
+        started=time.monotonic()
+        deadline=started+self.header_seconds+4
+        status=None
+        while time.monotonic()<deadline:
+            status,_=speak(self.port,probe,wait=2)
+            if status==200: break
+            time.sleep(0.05)
+        self.assertEqual(status,200,'the drippers held their slots past the header deadline')
+        self.assertLess(time.monotonic()-started,self.header_seconds+4)
 
 
 class ConnectionLimitTests(ServerTestCase):
@@ -364,6 +461,12 @@ class RefusalTests(ServerTestCase):
         self.refused(response_format={'type':'json_schema','json_schema':{'name':'x','strict':True,
                      'schema':{'type':'object','properties':{'a':{'$ref':'#/$defs/missing'}},
                                'required':['a'],'additionalProperties':False}}})
+    def test_a_pointer_the_precheck_used_to_disagree_about_is_400(self):
+        """`#/$defs//T` names an empty-string key. A precheck that skipped empty
+        pointer components read it as `#/$defs/T`, let it through, spent a turn,
+        and only then met the resolver's own exception."""
+        self.refused(response_format={'type':'json_schema','json_schema':{'name':'x','strict':True,
+                     'schema':{'type':'object','$defs':{'T':{'type':'object'}},'$ref':'#/$defs//T'}}})
     def test_resolved_local_reference_is_accepted(self):
         schema={'type':'object','$defs':{'text':{'type':'string'}},
                 'properties':{'a':{'$ref':'#/$defs/text'}},'required':['a'],'additionalProperties':False}
@@ -415,6 +518,41 @@ class RefusalTests(ServerTestCase):
         with patch.object(rt,'turn',side_effect=lambda *a,**k:rt.envelope('turn',error='Vendor CLI failed.')):
             status,body=call(self.base,'/v1/chat/completions',self.completion_body())
         self.assertEqual(status,502);self.assertIn('Vendor CLI failed.',body['error']['message'])
+
+
+class LivenessTests(ServerTestCase):
+    """The shortcut has one signature. Everything else without a
+    `response_format` is a 400 — no request can collect a judgment-shaped
+    `pong` by asking for a single token."""
+    def probe(self,body):
+        with patch.object(rt,'turn',side_effect=never_called):
+            return call(self.base,'/v1/chat/completions',body)
+    def test_the_exact_probe_is_answered_without_a_turn(self):
+        status,body=self.probe({'model':self.model_id,'max_tokens':1,
+                                'messages':[{'role':'user','content':'ping'}]})
+        self.assertEqual(status,200)
+        self.assertEqual(body['choices'][0]['message']['content'],'pong')
+        self.assertTrue(body['x_cog']['liveness'])
+    def test_every_near_miss_is_a_400(self):
+        for body in ({'model':self.model_id,'max_tokens':1,
+                      'messages':[{'role':'user','content':'Answer Y or N: prioritize this issue?'}]},
+                     {'max_tokens':1},
+                     {'model':self.model_id,'max_tokens':1},
+                     {'model':self.model_id,'max_tokens':2,
+                      'messages':[{'role':'user','content':'ping'}]},
+                     {'model':self.model_id,'max_tokens':1,
+                      'messages':[{'role':'user','content':'ping '}]},
+                     {'model':self.model_id,'max_tokens':1,'temperature':0,
+                      'messages':[{'role':'user','content':'ping'}]},
+                     {'model':self.model_id,'max_tokens':1,
+                      'messages':[{'role':'system','content':'Judge this.'},
+                                  {'role':'user','content':'ping'}]},
+                     {'model':self.model_id,'max_tokens':1,
+                      'messages':[{'role':'user','content':'ping'},
+                                  {'role':'user','content':'ping'}]}):
+            status,reply=self.probe(body)
+            self.assertEqual(status,400,body)
+            self.assertNotIn('choices',reply)
 
 
 class SerializationTests(ServerTestCase):
@@ -486,6 +624,60 @@ class AbandonedQueueTests(QueueTestCase):
         self.assertIn('left while queued',log.getvalue())
 
 
+class BudgetTests(QueueTestCase):
+    """One monotonic budget per request: the queue wait, the readiness commands
+    and the vendor command all draw on it."""
+    turn_timeout=2
+    queue_wait=30
+    min_inference=1
+    def test_the_queue_wait_is_bounded_by_what_the_budget_leaves(self):
+        release,started,calls,seen=threading.Event(),threading.Event(),[],{}
+        def turn(request,binding,model_binding=None,timeout=None):
+            seen['timeout']=timeout
+            return self.held_turn(release,started,calls)(request,binding,model_binding)
+        with patch.object(rt,'turn',side_effect=turn):
+            first=self.occupy(release,started,calls)
+            began=time.monotonic()
+            status,body=call(self.base,'/v1/chat/completions',self.completion_body())
+            elapsed=time.monotonic()-began
+            release.set();first.join(20)
+        self.assertEqual(status,503);self.assertEqual(body['error']['code'],'busy')
+        self.assertEqual(len(calls),1,'the refused request must not have started a turn')
+        self.assertLess(elapsed,self.turn_timeout,
+                        'the 30 s queue wait must be cut to what the 2 s budget leaves')
+        self.assertGreater(elapsed,self.turn_timeout-self.min_inference-0.5)
+        self.assertIn('budget',body['error']['message'])
+        # And the running turn was given the budget, not the flag's own value.
+        self.assertLessEqual(seen['timeout'],self.turn_timeout)
+        self.assertGreater(seen['timeout'],0)
+
+
+class ExhaustedBudgetTests(ServerTestCase):
+    """The budget starts when the request is accepted, so a slow upload spends
+    it like anything else. Too little left to finish a turn is 503 busy, not a
+    turn nobody will be waiting for."""
+    turn_timeout=1.0
+    min_inference=0.5
+    body_seconds=8
+    def test_a_budget_spent_before_the_turn_is_busy_and_spends_nothing(self):
+        head,_,raw=self.post(self.completion_body()).partition(b'\r\n\r\n')
+        sock=socket.create_connection(('127.0.0.1',self.port),timeout=15)
+        self.addCleanup(sock.close)
+        with patch.object(rt,'turn',side_effect=never_called):
+            sock.sendall(head+b'\r\n\r\n'+raw[:20])
+            time.sleep(self.turn_timeout+0.3)
+            sock.sendall(raw[20:])
+            sock.settimeout(10);data=b''
+            while b'\r\n\r\n' not in data or not data.endswith(b'}'):
+                chunk=sock.recv(65536)
+                if not chunk: break
+                data+=chunk
+        self.assertEqual(int(data.split(b' ')[1]),503,data[:120])
+        body=json.loads(data.split(b'\r\n\r\n')[-1].decode())
+        self.assertEqual(body['error']['code'],'busy')
+        self.assertIn('no turn was started',body['error']['message'])
+
+
 class DisconnectTests(ServerTestCase):
     def test_a_turn_whose_caller_left_finishes_and_is_discarded(self):
         started,finished=threading.Event(),threading.Event()
@@ -506,6 +698,76 @@ class DisconnectTests(ServerTestCase):
             with patch.object(rt,'turn',side_effect=fake_turn()):
                 self.assertEqual(call(self.base,'/v1/chat/completions',self.completion_body())[0],200)
         self.assertIn('discarded',log.getvalue())
+
+
+def final_response(data):
+    """The last HTTP response in a byte stream that may open with interim ones.
+    Every client must skip a 1xx; these tests read past them deliberately."""
+    heads=[block for block in data.split(b'\r\n\r\n') if block.startswith(b'HTTP/')]
+    return int(heads[-1].split(b' ')[1]),json.loads(data.split(b'\r\n\r\n')[-1].decode())
+
+
+class HalfCloseTests(ServerTestCase):
+    def test_a_half_closed_client_is_still_a_client(self):
+        """It sent everything it had to send and closed that direction only. It
+        is still reading, and the turn it paid for is delivered to it."""
+        log=io.StringIO()
+        with patch.object(rt,'turn',side_effect=fake_turn({'answer':'delivered'})),\
+             contextlib.redirect_stderr(log):
+            sock=socket.create_connection(('127.0.0.1',self.port),timeout=20)
+            self.addCleanup(sock.close)
+            sock.sendall(self.post(self.completion_body()))
+            sock.shutdown(socket.SHUT_WR)
+            data=b''
+            sock.settimeout(20)
+            while b'\r\n\r\n' not in data or not data.split(b'\r\n\r\n')[-1].endswith(b'}'):
+                chunk=sock.recv(65536)
+                if not chunk: break
+                data+=chunk
+        status,body=final_response(data)
+        self.assertEqual(status,200,data[:200])
+        self.assertEqual(json.loads(body['choices'][0]['message']['content']),{'answer':'delivered'})
+        self.assertNotIn('discarded',log.getvalue())
+
+
+class StalledReaderTests(ServerTestCase):
+    connections=1
+    write_seconds=0.5
+    def test_a_reader_that_stops_reading_is_dropped_at_the_write_deadline(self):
+        """A connected client that never drains the socket would otherwise hold
+        its slot for as long as it liked. Eight of those is the whole gateway."""
+        reached=threading.Event()
+        def turn(request,binding,model_binding=None,timeout=None):
+            # One replacement for both requests: a result too big for any
+            # socket buffer only for the one the stalled client sent.
+            huge='STALL' in request['task']['input']
+            if huge: reached.set()
+            return fake_turn({'answer':'x'*(4*1024*1024) if huge else 'ok'})(
+                request,binding,model_binding)
+        log=io.StringIO()
+        sock=socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,2048)  # before connect
+        sock.settimeout(10);sock.connect(('127.0.0.1',self.port))
+        self.addCleanup(sock.close)
+        with patch.object(rt,'turn',side_effect=turn),contextlib.redirect_stderr(log):
+            sock.sendall(self.post(self.completion_body(
+                messages=[{'role':'user','content':'STALL: reply and I will not read it'}])))
+            self.assertTrue(reached.wait(10),'the stalled request never reached its turn')
+            started=time.monotonic()
+            # Never read a byte of it. The slot must come back on its own.
+            self.assertEqual(call(self.base,'/health',timeout=5)[0],503,
+                             'the stalled reader should still hold the only slot')
+            status=None
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline:
+                status,_=call(self.base,'/v1/chat/completions',self.completion_body(),timeout=5)
+                if status==200: break
+                time.sleep(0.05)
+        self.assertEqual(status,200,'the stalled reader never gave its slot back')
+        elapsed=time.monotonic()-started
+        self.assertGreater(elapsed,self.write_seconds*0.5)
+        self.assertLess(elapsed,self.write_seconds+4,'dropped later than the write deadline')
+        self.assertIn('stopped reading',log.getvalue())
 
 
 class CallerTests(ServerTestCase):
@@ -560,6 +822,9 @@ class CallerTests(ServerTestCase):
         self.assertTrue(ok,detail)
         self.assertIn('identity matches',detail)
     def test_a_caller_without_the_token_is_refused(self):
+        """Two refusals, and today's caller names them differently. Its own
+        readiness probe cannot reach an authenticated `/health` or `/v1/models`,
+        so `invoke` stops before any completion (`model-unavailable`)."""
         with patch.object(self.core,'API_KEY',None):
             ok,detail=self.core.health()
             self.assertFalse(ok,detail)
@@ -567,6 +832,18 @@ class CallerTests(ServerTestCase):
                 envelope=self.core.invoke(self.bundle())
         self.assertFalse(envelope['ok'])
         self.assertEqual(envelope['error']['code'],'model-unavailable')
+    def test_the_gateways_401_on_a_completion_is_the_callers_call_failure(self):
+        """With the probe out of the way, the completion itself meets the 401.
+        Today's caller maps that HTTP error to `model-call-failed` — the code
+        this test asserted before the caller changed was `model-unavailable`."""
+        alive=(True,'probe bypassed: the transport refusal is what is under test')
+        with patch.object(self.core,'API_KEY',None),\
+             patch.object(self.core,'health',return_value=alive),\
+             patch.object(rt,'turn',side_effect=never_called):
+            envelope=self.core.invoke(self.bundle())
+        self.assertFalse(envelope['ok'])
+        self.assertEqual(envelope['error']['code'],'model-call-failed')
+        self.assertIn('401',envelope['error']['detail'])
 
 
 class NativeSchemaTests(unittest.TestCase):
@@ -589,6 +866,26 @@ class NativeSchemaTests(unittest.TestCase):
                        {'type':'object','$defs':{'x':{'type':'string'}},
                         'properties':{'a':{'type':'string'}},'required':['a'],'additionalProperties':False}):
             self.assertFalse(rt.native_schema(schema),schema)
+    def test_a_keyword_that_does_not_belong_to_the_type_is_not_native(self):
+        """JSON Schema permits `items` beside `properties` and ignores it; the
+        detector does not, because the vendor's strict parser may not."""
+        nested=lambda inner:{'type':'object','properties':{'a':inner},'required':['a'],
+                             'additionalProperties':False}
+        for schema in (dict(SCHEMA,items={'type':['object','null'],'$id':'nested'}),
+                       dict(SCHEMA,items={'type':'string'}),
+                       nested({'type':'string','properties':{'b':{'type':'string'}}}),
+                       nested({'type':'array','items':{'type':'string'},'required':['a']}),
+                       nested({'type':'object','properties':{'b':{'type':'string'}},
+                               'required':['b'],'additionalProperties':False,
+                               'items':{'type':'string'}}),
+                       nested({'type':'boolean','enum':[True]})):
+            self.assertFalse(rt.native_schema(schema),schema)
+    def test_the_subset_still_admits_what_it_always_did(self):
+        self.assertTrue(rt.native_schema({'type':'object','additionalProperties':False,
+            'required':['a','b'],'properties':{
+                'a':{'type':'string','enum':['x','y'],'description':'d'},
+                'b':{'type':'array','items':{'type':'object','additionalProperties':False,
+                     'required':['c'],'properties':{'c':{'type':'integer'}}}}}}))
 
 
 class CopyTests(unittest.TestCase):

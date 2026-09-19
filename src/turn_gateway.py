@@ -15,6 +15,7 @@ looks at anything else.
 """
 import argparse
 import hmac
+import io
 import json
 import os
 import select
@@ -37,13 +38,27 @@ SHORT_NAME = SHORT_NAME[4:] if SHORT_NAME.startswith('cog-') else SHORT_NAME
 CONSUMER = {'id': 'openteams/turn-gateway', 'version': '0.2.0'}
 MAX_BODY = 2 * 1024 * 1024
 MAX_CONNECTIONS = 8
-HEADER_SECONDS = 10      # installed before the request line is parsed
+HEADER_SECONDS = 10      # a TOTAL header deadline, not a per-packet one
 BODY_SECONDS = 10        # a TOTAL upload deadline, not a per-packet one
-TURN_SECONDS = 170       # under the context-cog caller's 180 s
-QUEUE_SECONDS = 60       # how long a second request waits for the turn lock
+WRITE_SECONDS = 30       # a TOTAL deadline for writing one response
+TURN_SECONDS = 170       # the END-TO-END budget, under the caller's 180 s
+QUEUE_SECONDS = 60       # the longest a second request waits for the turn lock
+MIN_INFERENCE_SECONDS = 30   # below this, 503 busy rather than a doomed turn
 TOKEN_VARIABLE = 'COG_TURN_GATEWAY_TOKEN'
 TOKEN_LENGTH = 32
 CONTEXT_ID = 'system'
+# The exact body `cog_core.health(deep=True)` sends, and nothing else.
+LIVENESS_MESSAGES = [{'role': 'user', 'content': 'ping'}]
+LIVENESS_KEYS = {'model', 'messages', 'max_tokens'}
+# An interim response every HTTP client must skip: the gateway's way of asking
+# a socket whether anybody is still there (see Requests.client_gone).
+INTERIM = b'HTTP/1.1 100 Continue\r\n\r\n'
+PROBE_PAUSE = 0.05       # long enough on loopback for a reset to come back
+# Inherited HTTP failures, answered as JSON error objects like every other one.
+INHERITED_CODES = {400: 'unsupported_request', 404: 'not_found', 408: 'request_timeout',
+                   411: 'unsupported_request', 414: 'request_too_large',
+                   431: 'request_too_large', 501: 'unsupported_method',
+                   505: 'unsupported_request'}
 # Accepted and ignored, as the docs say; a turn has no sampling controls.
 IGNORED_KEYS = {'temperature', 'max_tokens', 'max_completion_tokens'}
 REFUSED_KEYS = {'stream', 'n', 'tools', 'tool_choice', 'functions', 'function_call'}
@@ -56,6 +71,33 @@ SUPPORTED = ('A turn is one non-streaming request returning one JSON object: an 
 def note(message):
     """Operator log. No paths, bodies or completion text — request ids only."""
     print('turn gateway: ' + message, file=sys.stderr, flush=True)
+
+
+class Clocked(io.RawIOBase):
+    """A socket reader with TOTAL deadlines. The socket timeout is reset to
+    whatever remains of the current deadline before EVERY receive, so a client
+    that drips one byte every few seconds is cut off on time whatever its
+    rhythm — an inactivity timeout never expires for such a client, and a
+    buffered `read()` can perform many receives without the caller looking at a
+    clock in between. Wrapped in a BufferedReader so the request line, the
+    header block and the body are all read through it."""
+
+    def __init__(self, connection, seconds):
+        self.connection = connection
+        self.start(seconds)
+
+    def start(self, seconds):
+        self.deadline = time.monotonic() + seconds
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('read deadline elapsed')
+        self.connection.settimeout(remaining)
+        return self.connection.recv_into(buffer)
 
 
 class GatewayError(Exception):
@@ -216,19 +258,22 @@ def validated(body, binding, model_binding):
     request = translate(body, binding)
     try:
         rt.check_turn(request, binding, model_binding)
-    except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError) + rt.REFERENCE_ERRORS as exc:
         detail = str(exc) if isinstance(exc, ValueError) else 'Request could not be checked against the turn contract.'
         raise GatewayError(400, 'unsupported_request', f'{detail} ' + SUPPORTED) from None
     return request
 
 
 def is_liveness_probe(body, binding):
-    """`cog_core.health(deep=True)` sends a one-token ping with no
-    response_format. That is a liveness question, not a turn: answer it here and
-    spend nothing. Documented as liveness — it proves the gateway and its
-    binding, never the vendor."""
+    """ONE request body is answered without a turn: the exact one
+    `cog_core.health(deep=True)` sends — no `response_format`, `max_tokens` 1,
+    and `messages` exactly one user message reading `ping`. That is a liveness
+    question, not a turn. Anything else without a `response_format` is a 400:
+    a completion request must never be able to collect a fabricated
+    judgment-shaped `pong` by asking for one token."""
     return (isinstance(body, dict) and 'response_format' not in body
-            and not set(body) - {'model', 'messages', 'max_tokens', 'temperature'}
+            and not set(body) - LIVENESS_KEYS
+            and body.get('messages') == LIVENESS_MESSAGES
             and isinstance(body.get('max_tokens'), int) and not isinstance(body.get('max_tokens'), bool)
             and body['max_tokens'] == 1
             and body.get('model', served_model(binding)) == served_model(binding))
@@ -250,8 +295,13 @@ def perform(request, binding, model_binding, timeout):
     own error code, never a fabricated completion."""
     try:
         response = rt.turn(request, binding, model_binding, timeout)
-    except (ValueError, OSError, TypeError, KeyError) as exc:
-        detail = str(exc) if isinstance(exc, ValueError) else 'Invalid or unavailable local document.'
+    except (ValueError, OSError, TypeError, KeyError) + rt.REFERENCE_ERRORS as exc:
+        if isinstance(exc, ValueError):
+            detail = str(exc)
+        elif rt.REFERENCE_ERRORS and isinstance(exc, rt.REFERENCE_ERRORS):
+            detail = 'A schema reference in this request does not resolve; no result was accepted.'
+        else:
+            detail = 'Invalid or unavailable local document.'
         response = rt.envelope('turn', error=detail)
     if not response['ok']:
         error = response['error'] or {'code': 'turn-provider', 'detail': 'Turn failed.'}
@@ -311,10 +361,13 @@ class Gateway(ThreadingHTTPServer):
 
 
 def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
-                turn_timeout=None, queue_wait=None, connections=None):
+                turn_timeout=None, queue_wait=None, connections=None,
+                min_inference=None, header_seconds=None, body_seconds=None,
+                write_seconds=None):
     """A loopback server for one binding. The bearer token, like the binding, is
     read once here — and it is mandatory: without it any page in a local browser
-    could spend this subscription."""
+    could spend this subscription. Every deadline is a parameter so tests can
+    use small ones instead of waiting out the real ones."""
     refuse(host == LOOPBACK, f'--host {host}: the turn gateway binds {LOOPBACK} only. '
                              f'It is the owner\'s own vendor login, never a route for '
                              f'anyone else\'s subscription.')
@@ -330,20 +383,38 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
     model = served_model(binding)
     turn_timeout = TURN_SECONDS if turn_timeout is None else turn_timeout
     queue_wait = QUEUE_SECONDS if queue_wait is None else queue_wait
+    min_inference = MIN_INFERENCE_SECONDS if min_inference is None else min_inference
+    header_seconds = HEADER_SECONDS if header_seconds is None else header_seconds
+    body_seconds = BODY_SECONDS if body_seconds is None else body_seconds
+    write_seconds = WRITE_SECONDS if write_seconds is None else write_seconds
     one_turn = threading.Lock()
 
     class Requests(BaseHTTPRequestHandler):
-        # Installed by StreamRequestHandler.setup(), i.e. BEFORE the request
-        # line and headers are parsed: incomplete headers cannot hold a thread.
-        timeout = HEADER_SECONDS
+        timeout = header_seconds   # the socket timeout Clocked then keeps arming
         answered = False
+        budget = None
 
         def log_message(self, *args):
             pass  # No paths, bodies or completion text in access logs.
 
+        def setup(self):
+            super().setup()
+            # Every read on this connection now runs against a total deadline.
+            self.clock = Clocked(self.connection, header_seconds)
+            self.rfile = io.BufferedReader(self.clock)
+
+        def handle_one_request(self):
+            self.answered = False
+            self.budget = None
+            self.clock.start(header_seconds)
+            super().handle_one_request()
+
         def respond(self, status, value):
+            """Writing is deadlined too: a connected client that stops reading
+            would otherwise hold a slot for as long as it liked."""
             data = json.dumps(value, allow_nan=False).encode()
             self.answered = True  # set first: never a second response attempt
+            self.connection.settimeout(write_seconds)
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
@@ -357,6 +428,24 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                 self.respond(exc.status, exc.body())
             except OSError:
                 self.close_connection = True
+
+        def send_error(self, code, message=None, explain=None):
+            """Inherited HTTP failures — an unsupported method, an over-long
+            request line, a header block the parser rejects — answer with the
+            same JSON error object as every other refusal. The one failure with
+            no response at all is a client that never finishes its headers:
+            there is no request to answer."""
+            if self.answered:
+                return
+            self.close_connection = True
+            detail = explain or message or self.responses.get(code, ('Request refused.',))[0]
+            kind = 'api_error' if int(code) >= 500 else 'invalid_request_error'
+            error = GatewayError(code, INHERITED_CODES.get(int(code), 'unsupported_request'),
+                                 str(detail), kind)
+            try:
+                self.respond(code, error.body())
+            except OSError:
+                pass
 
         def guard(self):
             """Browser-shaped requests are refused before anything else. A
@@ -375,7 +464,14 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                 raise GatewayError(403, 'forbidden_origin',
                                    'A browser origin is never a caller here: this gateway '
                                    'spends the owner\'s own subscription.', 'permission_error')
-            offered = self.headers.get('Authorization', '').encode('utf-8', 'replace')
+            credentials = self.headers.get_all('Authorization') or ['']
+            if len(credentials) != 1:
+                # Whichever one a proxy or a client meant, the pair is ambiguous
+                # and must fail the same way in either order.
+                raise GatewayError(400, 'unsupported_request',
+                                   'Exactly one Authorization header is accepted; this request '
+                                   'carried ' + str(len(credentials)) + '.')
+            offered = credentials[0].encode('utf-8', 'replace')
             if not hmac.compare_digest(offered, expected):
                 raise GatewayError(401, 'invalid_api_key',
                                    f'Every route requires the bearer token the gateway was '
@@ -408,17 +504,15 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                 raise GatewayError(400, 'unsupported_request', 'Request body is not JSON.') from None
 
         def read_exactly(self, length):
-            """A TOTAL upload deadline, not a per-packet one: a drip feed that
-            never idles longer than the socket timeout is still a 408."""
+            """A TOTAL upload deadline, not a per-packet one: the clock is armed
+            before every receive, so a drip feed that never idles longer than a
+            socket timeout is still a 408 at the deadline."""
             late = GatewayError(408, 'request_timeout',
-                                f'The request body did not arrive within {BODY_SECONDS} seconds.',
+                                f'The request body did not arrive within {body_seconds:g} seconds.',
                                 'api_error')
-            deadline, chunks, read = time.monotonic() + BODY_SECONDS, [], 0
+            self.clock.start(body_seconds)
+            chunks, read = [], 0
             while read < length:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise late
-                self.connection.settimeout(remaining)
                 try:
                     chunk = self.rfile.read(min(length - read, 65536))
                 except (TimeoutError, socket.timeout):
@@ -431,11 +525,32 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
             return b''.join(chunks)
 
         def client_gone(self):
-            """Has the caller given up? A queued request whose client left must
-            not spend a turn on its way out."""
+            """Has the caller really gone? End of file on the REQUEST side does
+            not say so: a client may half-close its sending direction and go on
+            reading, and this platform reports the same readable/hang-up
+            condition for that as for a socket whose owner has left. The only
+            honest question is whether a write still reaches somebody, so ask it
+            with an interim response every HTTP client skips: a peer that has
+            gone resets the first one and the second write fails. A reader too
+            slow to drain is still a reader — that is the write deadline's
+            business, not this one's."""
             try:
-                ready, _, _ = select.select([self.connection], [], [], 0)
-                return bool(ready) and self.connection.recv(1, socket.MSG_PEEK) == b''
+                poller = select.poll()
+                poller.register(self.connection, select.POLLIN)
+                events = poller.poll(0)
+                if not events:
+                    return False                              # nothing pending
+                if events[0][1] & (select.POLLERR | select.POLLNVAL):
+                    return True
+                if self.connection.recv(1, socket.MSG_PEEK):
+                    return False                              # unread bytes, not EOF
+                self.connection.settimeout(write_seconds)
+                self.connection.sendall(INTERIM)
+                time.sleep(PROBE_PAUSE)
+                self.connection.sendall(INTERIM)
+                return False
+            except (TimeoutError, socket.timeout):
+                return False
             except OSError:
                 return True
 
@@ -463,6 +578,11 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
 
         def do_POST(self):
             self.answered = False
+            # One monotonic budget per request, from the moment it is accepted:
+            # the queue wait, the readiness commands and the vendor command all
+            # draw on it. 170 s of inference after 60 s of queueing and 45 s of
+            # readiness is a result nobody is still waiting for.
+            self.budget = time.monotonic() + turn_timeout
             try:
                 self.guard()
                 if self.path.rstrip('/') != '/v1/chat/completions':
@@ -479,18 +599,33 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                 self.fail(GatewayError(503, 'gateway_unavailable', 'Gateway unavailable.',
                                        'api_error'))
 
+        def busy(self, detail):
+            return GatewayError(503, 'busy', detail, 'api_error')
+
         def complete(self, request):
-            """One turn at a time, with both ends of the wait bounded: the queue
-            gives up with a 503, and a caller that left is never spent on."""
-            if not one_turn.acquire(timeout=queue_wait):
-                raise GatewayError(503, 'busy', f'A turn is already running and the '
-                                                f'{queue_wait} s queue wait elapsed. This '
-                                                f'gateway performs one turn at a time.',
-                                   'api_error')
+            """One turn at a time, and every wait drawn from the one budget: a
+            turn is started only if enough of the request's own deadline is
+            left to finish it, and a caller that has gone is never spent on."""
+            remaining = self.budget - time.monotonic()
+            wait = min(queue_wait, remaining - min_inference)
+            if wait <= 0:
+                raise self.busy(f'The {turn_timeout:g} s end-to-end budget for this request has '
+                                f'less than the {min_inference:g} s a turn needs left in it, so no '
+                                f'turn was started. Raise --turn-timeout and the caller\'s '
+                                f'request_timeout_s together.')
+            if not one_turn.acquire(timeout=wait):
+                raise self.busy(f'A turn is already running and this request\'s share of its '
+                                f'{turn_timeout:g} s budget ({wait:g} s of queue wait) elapsed. '
+                                f'This gateway performs one turn at a time.')
             try:
+                remaining = self.budget - time.monotonic()
+                if remaining < min_inference:
+                    raise self.busy(f'Only {remaining:.1f} s of this request\'s {turn_timeout:g} s '
+                                    f'budget was left when the turn lock came free, under the '
+                                    f'{min_inference:g} s minimum; no turn was started.')
                 if self.client_gone():
                     return self.drop(request, 'left while queued; no turn was started')
-                result = perform(request, binding, model_binding, turn_timeout)
+                result = perform(request, binding, model_binding, remaining)
             finally:
                 one_turn.release()
             # The turn is already paid for. If the caller has gone, it is
@@ -500,7 +635,8 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
             try:
                 self.respond(200, result)
             except OSError:
-                self.drop(request, 'left during the turn; the completed result is discarded')
+                self.drop(request, 'stopped reading before the write deadline; the completed '
+                                   'result is discarded')
 
         def drop(self, request, reason):
             self.close_connection = True
@@ -520,24 +656,34 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=DEFAULT_PORTS[rt.ENGINE['engine']])
     parser.add_argument('--host', default=LOOPBACK)
     parser.add_argument('--turn-timeout', type=float, default=TURN_SECONDS,
-                        help='seconds allowed for one vendor turn (default %(default)s, '
-                             'under the context-cog caller\'s 180 s)')
+                        help='the END-TO-END budget in seconds for one request — queue wait, '
+                             'readiness commands and the vendor command together (default '
+                             '%(default)s, under the context-cog caller\'s 180 s; a caller with '
+                             'a longer request_timeout_s raises this to at least 10 s below it)')
     parser.add_argument('--queue-wait', type=float, default=QUEUE_SECONDS,
-                        help='seconds a second request waits for the turn lock before '
-                             '503 busy (default %(default)s)')
+                        help='the longest a second request waits for the turn lock before '
+                             '503 busy; the budget may shorten it (default %(default)s)')
+    parser.add_argument('--min-inference', type=float, default=MIN_INFERENCE_SECONDS,
+                        help='seconds of budget a turn needs to be worth starting; below it '
+                             'the answer is 503 busy and no turn is spent (default %(default)s)')
     args = parser.parse_args(argv)
     try:
-        refuse(args.turn_timeout > 0 and args.queue_wait > 0,
-               '--turn-timeout and --queue-wait must both be positive.')
+        refuse(args.turn_timeout > 0 and args.queue_wait > 0 and args.min_inference > 0,
+               '--turn-timeout, --queue-wait and --min-inference must all be positive.')
+        refuse(args.min_inference < args.turn_timeout,
+               f'--min-inference {args.min_inference:g} is not less than --turn-timeout '
+               f'{args.turn_timeout:g}: every request would be answered 503 busy.')
         binding, model_binding = prepare(args.binding, args.model_binding)
         server = make_server(binding, model_binding, args.port, args.host,
-                             args.turn_timeout, args.queue_wait)
+                             args.turn_timeout, args.queue_wait,
+                             min_inference=args.min_inference)
     except ValueError as exc:
         print('turn gateway refuses to start: ' + str(exc), file=sys.stderr)
         return 2
     note(f'on http://{LOOPBACK}:{server.server_port}/v1 serving {served_model(binding)} '
-         f'(one turn at a time, {args.turn_timeout:g} s each; bearer token required on '
-         f'every route; loopback only; restart after any rebind)')
+         f'(one turn at a time; {args.turn_timeout:g} s end to end per request, of which a '
+         f'turn needs {args.min_inference:g} s to start; bearer token required on every '
+         f'route; loopback only; restart after any rebind)')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

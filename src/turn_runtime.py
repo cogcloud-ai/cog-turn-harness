@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 
 from jsonschema import Draft202012Validator
@@ -29,6 +30,28 @@ IDENTITY = CARD['provider']
 MAX_BYTES = 8 * 1024 * 1024
 VENDOR_SECONDS = 600
 MODEL_SECONDS = 180
+READY_SECONDS = 15       # one readiness command, or what the budget leaves
+
+
+def _reference_errors():
+    """The exception family the resolver that jsonschema ACTUALLY uses raises
+    for a reference it cannot resolve. Caught in the precheck and again after a
+    turn, so a schema that defeats the precheck is an error object, never a
+    traceback."""
+    found = []
+    try:  # jsonschema >= 4.18 resolves through its own `referencing` dependency
+        from referencing.exceptions import Unresolvable
+        found.append(Unresolvable)
+    except ImportError:  # pragma: no cover - older jsonschema
+        pass
+    from jsonschema import exceptions as _exceptions
+    legacy = getattr(_exceptions, '_RefResolutionError', None)
+    if isinstance(legacy, type):
+        found.append(legacy)
+    return tuple(found)
+
+
+REFERENCE_ERRORS = _reference_errors()
 
 
 def require(condition, message):
@@ -48,6 +71,8 @@ def validate(value, definition=None, schema=None):
         errors = list(Draft202012Validator(schema).iter_errors(value))
     except SchemaError as exc:
         raise ValueError('Schema is not a valid JSON Schema: ' + str(exc).split('\n')[0]) from None
+    except REFERENCE_ERRORS as exc:
+        raise ValueError('Schema reference does not resolve: ' + str(exc).split('\n')[0]) from None
     require(not errors, 'Contract validation failed: ' + (str(errors[0].json_path) if errors else ''))
 
 
@@ -105,17 +130,35 @@ def vendor_executable():
     return executable
 
 
-def doctor():
+def remaining_budget(deadline, what):
+    """What is left of ONE monotonic end-to-end budget. Nothing starts on an
+    exhausted budget: a command begun with no time left can only be killed."""
+    if deadline is None:
+        return None
+    left = deadline - time.monotonic()
+    require(left > 0, f'The turn budget was spent before {what} could start; no turn was performed.')
+    return left
+
+
+def readiness_timeout(deadline):
+    left = remaining_budget(deadline, 'a readiness command')
+    return READY_SECONDS if left is None else min(READY_SECONDS, left)
+
+
+def doctor(deadline=None):
+    """`deadline` is a monotonic instant: the readiness commands draw on the
+    same end-to-end budget as the turn they precede, each getting
+    min(READY_SECONDS, what remains)."""
     engine = ENGINE['engine']
     if engine == 'openai-compatible':
         return {'available': True, 'engine': engine, 'version': IDENTITY['version']}
     executable = vendor_executable()
     require(executable is not None, 'Install the vendor CLI and log in with your subscription first.')
-    version = command([executable, '--version'], timeout=15).strip()
-    help_text = command([executable, 'exec', '--help'] if engine == 'codex' else [executable, '--help'], timeout=15)
+    version = command([executable, '--version'], timeout=readiness_timeout(deadline)).strip()
+    help_text = command([executable, 'exec', '--help'] if engine == 'codex' else [executable, '--help'], timeout=readiness_timeout(deadline))
     flags = ['--ignore-user-config', '--ephemeral', '--output-schema'] if engine == 'codex' else ['--safe-mode', '--tools', '--no-session-persistence', '--json-schema']
     require(all(x in help_text for x in flags), 'This vendor CLI is too old for the adapter safety and output controls.')
-    status = command([executable, 'login', 'status'] if engine == 'codex' else [executable, 'auth', 'status'], timeout=15, include_stderr=engine == 'codex')
+    status = command([executable, 'login', 'status'] if engine == 'codex' else [executable, 'auth', 'status'], timeout=readiness_timeout(deadline), include_stderr=engine == 'codex')
     if engine == 'codex':
         require('ChatGPT' in status, 'A ChatGPT subscription login is required; API-key login is not accepted.')
     else:
@@ -158,31 +201,42 @@ def candidate(request, inspect=doctor):
             'status': 'candidate', 'binding': binding, 'problems': []}
 
 
+def reference_lookup(schema):
+    """The resolver the validator will actually use for this schema. A second
+    implementation of JSON Pointer is a second opinion: one that accepts what
+    the real resolver rejects spends a turn and fails afterwards, and one that
+    rejects what it accepts refuses a legal schema."""
+    validator = Draft202012Validator(schema)
+    resolver = getattr(validator, '_resolver', None)      # jsonschema >= 4.18
+    if resolver is not None and hasattr(resolver, 'lookup'):
+        return resolver.lookup
+    legacy = getattr(validator, 'resolver', None)         # pragma: no cover
+    return legacy.resolve if legacy is not None and hasattr(legacy, 'resolve') else None
+
+
 def references_resolve(schema):
     """Every `$ref` in the output schema must be a pointer that resolves inside
-    this document. A remote reference is unsupported; an unresolved local one
-    would otherwise survive schema checking, spend a turn, and only fail when
-    the result is validated."""
-    def resolves(pointer):
-        node = schema
-        for token in pointer[1:].split('/'):
-            if not token:
-                continue
-            token = token.replace('~1', '/').replace('~0', '~')
-            if isinstance(node, dict) and token in node:
-                node = node[token]
-            elif isinstance(node, list) and token.isdigit() and int(token) < len(node):
-                node = node[int(token)]
-            else:
-                return False
-        return True
+    this document, CHECKED WITH THAT RESOLVER. A remote reference is
+    unsupported; an unresolved local one would otherwise survive schema
+    checking, spend a turn, and only fail when the result is validated."""
+    try:
+        lookup = reference_lookup(schema)
+    except (ValueError, TypeError, AttributeError, KeyError) + REFERENCE_ERRORS:
+        lookup = None
 
     def walk(node):
         if isinstance(node, dict):
             for key, value in node.items():
                 if key in ('$ref', '$dynamicRef'):
                     require(isinstance(value, str) and value.startswith('#'), 'Remote schema references are unsupported.')
-                    require(resolves(value), f'Output schema reference {value} does not resolve inside the schema.')
+                    if lookup is None:  # pragma: no cover - no resolver to ask
+                        require(False, 'Output schema references cannot be checked; send a schema without $ref.')
+                    try:
+                        lookup(value)
+                    except REFERENCE_ERRORS:
+                        raise ValueError(f'Output schema reference {value} does not resolve inside the schema.') from None
+                    except (ValueError, TypeError, AttributeError, KeyError):
+                        raise ValueError(f'Output schema reference {value} could not be resolved.') from None
                 walk(value)
         elif isinstance(node, list):
             for value in node:
@@ -258,8 +312,10 @@ def infer_model(request, model_binding, timeout=None):
 
 def infer_vendor(request, binding, timeout=None):
     engine = ENGINE['engine']
+    # `timeout` is the WHOLE remaining budget for this turn, readiness included.
     timeout = VENDOR_SECONDS if timeout is None else timeout
-    status = doctor()
+    deadline = time.monotonic() + timeout
+    status = doctor(deadline)
     require(status['version'] == binding['harness']['version'], 'Vendor harness version changed; rebind before invoking.')
     prompt = '\n\n'.join(x['content'] for x in request['context']) + '\n\nTASK DATA:\n' + request['task']['input']
     schema = request['task']['output_schema']
@@ -275,6 +331,7 @@ def infer_vendor(request, binding, timeout=None):
     # full schema, meta keys included, still validates the result below.
     vendor_schema = {k: v for k, v in schema.items() if k not in STRIPPED_KEYS}
     with tempfile.TemporaryDirectory(prefix='cog-turn-') as directory:
+        timeout = remaining_budget(deadline, 'the vendor command')
         directory = Path(directory)
         schema_file = directory / 'output-schema.json'
         schema_file.write_text(json.dumps(vendor_schema))
@@ -337,23 +394,34 @@ def parse_result_text(text):
 
 
 NATIVE_TYPES = {'object', 'array', 'string', 'integer', 'number', 'boolean'}
-NATIVE_KEYS = {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'description', 'title'}
+NATIVE_COMMON = {'type', 'description', 'title'}
+# Keys that belong to each declared type, and to no other. `items` on an object
+# or `properties` on a string is legal JSON Schema and inert, but a node
+# carrying it is not the shape this subset describes.
+NATIVE_FOR_TYPE = {'object': {'properties', 'required', 'additionalProperties'},
+                   'array': {'items'},
+                   'string': {'enum'}, 'integer': {'enum'},
+                   'number': {'enum'}, 'boolean': set()}
+NATIVE_KEYS = NATIVE_COMMON | set().union(*NATIVE_FOR_TYPE.values())
 STRIPPED_KEYS = ('$schema', '$id')
 
 
 def native_schema(schema, top=True):
     """The vendor strict structured-output subset, named exhaustively: a closed
     tree of single-typed nodes built from the keys above and nothing else.
-    A `type` LIST, a nested meta key, a `$ref`, a combinator or any keyword not
-    enumerated here selects the prompt-based path instead — an honest prompt
-    beats a schema the vendor may reject or silently narrow. Local validation
-    against the full schema stays normative on both paths."""
+    A `type` LIST, a nested meta key, a `$ref`, a combinator, any keyword not
+    enumerated here, and any keyword that does not belong to THIS node's
+    declared type select the prompt-based path instead — an honest prompt beats
+    a schema the vendor may reject or silently narrow. Every subschema-bearing
+    keyword the subset allows is visited; nothing rides along unexamined. Local
+    validation against the full schema stays normative on both paths."""
     if not isinstance(schema, dict):
-        return False
-    if set(schema) - ((NATIVE_KEYS | set(STRIPPED_KEYS)) if top else NATIVE_KEYS):
         return False
     kind = schema.get('type')
     if not isinstance(kind, str) or kind not in NATIVE_TYPES:  # a type LIST included
+        return False
+    allowed = NATIVE_COMMON | NATIVE_FOR_TYPE[kind] | (set(STRIPPED_KEYS) if top else set())
+    if set(schema) - allowed:
         return False
     enum = schema.get('enum')
     if 'enum' in schema and not (isinstance(enum, list) and enum
@@ -367,10 +435,13 @@ def native_schema(schema, top=True):
                 and all(native_schema(value, False) for value in properties.values()))
     if kind == 'array':
         return 'items' in schema and native_schema(schema['items'], False)
-    return 'properties' not in schema and 'items' not in schema
+    return True
 
 
 def turn(request, binding, model_binding=None, timeout=None):
+    """`timeout` is what remains of ONE end-to-end budget for this request:
+    readiness commands and the vendor command both draw on it, and neither
+    starts once it is gone."""
     check_turn(request, binding, model_binding)
     result, observations = (infer_model(request, model_binding, timeout) if ENGINE['engine'] == 'openai-compatible'
                             else infer_vendor(request, binding, timeout))

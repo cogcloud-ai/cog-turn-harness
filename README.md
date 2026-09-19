@@ -84,10 +84,19 @@ could never serve a turn (wrong composition or capability, or missing
 on every completion. The default port is 8123; the sibling providers default
 to 8121 (cog-claude) and 8122 (cog-chatgpt).
 
-Two deadlines are yours to set. `--turn-timeout` (default 170 s, deliberately
-under the context-cog caller's 180 s) is the time one turn is allowed, and it is
-passed to the vendor command. `--queue-wait` (default 60 s) is how long a second
-request waits for the turn lock before it is answered `503 busy`.
+**One budget covers the whole request.** `--turn-timeout` (default 170 s,
+deliberately under the context-cog caller's 180 s) is the END-TO-END deadline,
+counted from the moment a request is accepted: the wait for the turn lock, the
+vendor readiness commands (each capped at 15 s, or at whatever is left) and the
+vendor command itself all draw on the same remaining time. `--queue-wait`
+(default 60 s) is the longest a second request may wait for the lock, and the
+budget shortens it — queueing can never eat the time the turn needs.
+`--min-inference` (default 30 s) is what a turn needs to be worth starting: when
+less than that remains, the answer is `503 busy` and **no turn is spent**.
+
+Raise both ends together for slower Cogs: a caller's `request_timeout_s` must
+exceed `--turn-timeout` by at least 10 s. For a sweep whose Cogs allow 600 s,
+start the gateway with `--turn-timeout 590 --queue-wait 60 --min-inference 30`.
 
 The surface is `POST /v1/chat/completions`, `GET /v1/models` and `GET /health`.
 The one model id served is `turn-harness/<binding_id>@<revision>`; a request naming
@@ -108,23 +117,36 @@ never a dropped connection, and never a traceback:
 | Situation | Status |
 |---|---|
 | missing or wrong bearer token | 401 |
+| more than one `Authorization` header | 400 |
 | a `Host` that is not `127.0.0.1:<port>` or `localhost:<port>`, or any `Origin` header | 403 |
 | a `POST` body that is not `Content-Type: application/json` | 415 |
 | anything a turn does not support — including a nested `response_format` type, a schema `jsonschema` rejects, a `$ref` that does not resolve inside the schema, and a malformed `Content-Length` | 400 |
 | a declared body over 2 MiB | 413 |
 | a body that does not finish arriving within 10 s | 408 |
 | all 8 connection slots in use, or the queue wait elapsed | 503 |
+| less of this request's budget left than `--min-inference` | 503, with no turn spent |
+| a method or request line the HTTP parser itself rejects (`PUT /health`) | its own status, as the same JSON error object |
 | the turn itself failed | 502, with the provider's own error code |
 
 Nothing reaches the vendor until the whole request has passed every one of these
-checks. Request headers must arrive within 10 s as well, so a half-open
-connection cannot hold a thread.
+checks. **Every deadline is a total, not a gap between packets.** Headers get
+10 s, the body gets 10 s, and each response gets 30 s to be written; what remains
+is re-armed on the socket before every single receive, so a client that drips one
+byte at a time is cut off on schedule instead of holding a slot indefinitely, and
+a connected client that stops reading its response is dropped at the write
+deadline and its slot returned. The one failure that gets no answer at all is a
+client that never finishes sending its headers: there is no request to answer and
+the connection is closed silently. Everything else — failures raised by the
+inherited HTTP parser included — is the same JSON `error` object.
 
-One request is answered without a turn: a body with **no `response_format` and
-`max_tokens: 1`** is the deep-health ping `cog_core.health(deep=True)` sends, and
-it is answered `200` with a fixed `pong` completion. That is a **liveness**
-answer about the gateway and its binding — it proves nothing about the vendor,
-and it spends nothing.
+One request is answered without a turn, and it has an exact signature: **no
+`response_format`, `max_tokens: 1`, and `messages` exactly
+`[{"role": "user", "content": "ping"}]`** — the deep-health ping
+`cog_core.health(deep=True)` sends, and nothing else. It is answered `200` with a
+fixed `pong` completion. That is a **liveness** answer about the gateway and its
+binding: it proves nothing about the vendor and it spends nothing. Any other body
+without a `response_format` is a `400`, so no request can collect a
+judgment-shaped success by asking for a single token.
 
 Honestly:
 
@@ -140,10 +162,14 @@ Honestly:
   identity stays unverified and is reported as such. The `serve` endpoint is
   therefore a harness in front of somebody's admitted model, not a way to
   resell a vendor login.
-- **A caller that walks away is not spent on twice.** Before a queued request
-  starts a turn, the gateway checks its caller is still connected and drops it
-  if not. A turn whose caller leaves *while it runs* finishes, and its result is
-  **discarded and logged** — no second response is attempted.
+- **A caller that walks away is not spent on twice — and a half-closed client is
+  still a client.** Before a queued request starts a turn the gateway asks
+  whether anybody is still there, and it asks by *writing* (an interim
+  `100 Continue`, which every HTTP client skips), because end of file on the
+  *request* side only means the caller finished sending. A caller counts as gone
+  when the socket reports an error or a write fails, and only then; otherwise the
+  result it paid for is delivered. A turn whose caller really did leave finishes,
+  and its result is **discarded and logged** — no second response is attempted.
 - **Restart after any rebind.** The gateway runs outside the workbench host, so
   **revocation there does not reach a running gateway**. Binding documents and
   the token are read once at start (working rule 6).
@@ -191,9 +217,12 @@ independent model judgment.
 covers composition rejection, candidate/admitted separation, exact references,
 locality, feature and pinning constraints, credential filtering, context/schema
 checks, command controls, version changes and schema fallback. The gateway
-suite adds the transport boundary — mandatory token, Host allowlist, Origin,
-media type, header/body deadlines, connection limit, an abandoned queue entry
-and a caller that leaves mid-turn — and drives the REAL context-cog caller
+suite adds the transport boundary — mandatory token and exactly one
+`Authorization` header, Host allowlist, Origin, media type, total header, body
+and write deadlines exercised with trickling and stalled clients, the connection
+limit, one end-to-end budget shared by queueing, readiness and inference, an
+abandoned queue entry, a half-closed caller that still receives its result and a
+caller that leaves mid-turn — and drives the REAL context-cog caller
 (`cog_core.invoke` and `health`) against a live loopback server with the vendor
 replaced, skipping with a message when no context Cog sits beside the package. See the suite's
 `docs/verification-2026-09-07.md` for live-test status. No live quality claim is
@@ -220,9 +249,9 @@ siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `be73439df29b140861992215635e977cbd8c2711ee0fee3e3951430b4ea3192c`
-- `src/turn_gateway.py` — `efcd63f46a999364d102737d5c93c0697c11f5d44f14b6401292bb2faf39bae3`
-- `tests/test_gateway.py` — `11bc8b77506762c4683a7837d991dc14d42c0c27afbe4dca8ead898dbf20ae1f`
-- `tests/test_provider.py` — `371ea2025293e66aab08fdf9b91b6f5dc350e1534bfa4dc79f50b50a6f62a00a`
+- `src/turn_runtime.py` — `5ba0b76f11fe6ecfe853d13f8209a2e48cc9b26fe5257e3fe95b25535ec5326e`
+- `src/turn_gateway.py` — `3d0e749bd9a1defafb5284e3908ff05345128cddaef34bcbde5a80d097b0166b`
+- `tests/test_gateway.py` — `a19d8dac32ca8f71b0f17094b42ce4b48cb6dfe75b7eedda370db44bafd84163`
+- `tests/test_provider.py` — `f0f7b43e2d25a648ca9061e6a21733ab841b23612f1c9b5d41179e868796b9c4`
 
 Official integration references are in `docs/sources.md`.

@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
@@ -136,5 +137,59 @@ class ProviderTests(unittest.TestCase):
     def test_native_schema_support_is_conservative(self):
         self.assertTrue(rt.native_schema(self.turn['task']['output_schema']))
         self.assertFalse(rt.native_schema({'type':'object'}))
+    def test_readiness_commands_draw_on_the_turn_budget(self):
+        """Three readiness commands at a flat fifteen seconds each used to be
+        spent BEFORE the turn's own deadline began. They are inside it now."""
+        for engine in ('codex','claude'):
+            for budget,expected in ((100,rt.READY_SECONDS),(5,5)):
+                seen=[]
+                def command(argv,prompt=None,cwd=None,timeout=None,include_stderr=False):
+                    seen.append(timeout)
+                    if '--help' in argv:
+                        return ('--ignore-user-config --ephemeral --output-schema' if engine=='codex'
+                                else '--safe-mode --tools --no-session-persistence --json-schema')
+                    if 'status' in argv:
+                        return 'ChatGPT' if engine=='codex' else json.dumps({'loggedIn':True,'authMethod':'claude.ai'})
+                    return 'test-cli 1'
+                with patch.dict(rt.ENGINE,{'engine':engine}),\
+                     patch.object(rt,'vendor_executable',return_value='/fake/vendor'),\
+                     patch.object(rt,'command',side_effect=command):
+                    rt.doctor(time.monotonic()+budget)
+                self.assertEqual(len(seen),3)
+                for value in seen:
+                    self.assertLessEqual(value,expected)
+                    self.assertGreater(value,expected-1)
+    def test_an_exhausted_budget_starts_nothing(self):
+        with patch.dict(rt.ENGINE,{'engine':'claude'}),\
+             patch.object(rt,'vendor_executable',return_value='/fake/vendor'),\
+             patch.object(rt,'command',side_effect=AssertionError('no command may start')):
+            with self.assertRaisesRegex(ValueError,'budget was spent before'):
+                rt.doctor(time.monotonic()-1)
+    def test_the_vendor_command_gets_what_readiness_left(self):
+        binding=copy.deepcopy(self.binding);binding['model']={'id':'synthetic-model','revision':None,'digest':None}
+        seen={}
+        def command(argv,prompt,cwd,timeout=None):
+            seen['timeout']=timeout
+            return json.dumps({'type':'result','subtype':'success','is_error':False,
+                               'result':json.dumps({'ready':True})})
+        def slow_doctor(deadline=None):
+            time.sleep(0.2)
+            return {'version':'test-cli 1'}
+        with patch.dict(rt.ENGINE,{'engine':'claude'}),patch.object(rt,'doctor',side_effect=slow_doctor),\
+             patch.object(rt,'vendor_executable',return_value='/fake/vendor'),\
+             patch.object(rt,'command',side_effect=command):
+            rt.infer_vendor(self.turn,binding,timeout=5)
+        self.assertLess(seen['timeout'],4.9,'readiness time must come out of the same budget')
+        self.assertGreater(seen['timeout'],4.0)
+    def test_a_reference_is_checked_with_the_resolver_that_will_resolve_it(self):
+        # An empty pointer component names an empty-string key: the real
+        # resolver says no, and so must the precheck.
+        self.turn['task']['output_schema']={'type':'object','$defs':{'T':{'type':'object'}},
+                                            '$ref':'#/$defs//T'}
+        with self.assertRaisesRegex(ValueError,'does not resolve'):
+            rt.check_turn(self.turn,self.binding,self.model)
+        self.turn['task']['output_schema']={'type':'object','$defs':{'':{'T':{'type':'object'}}},
+                                            '$ref':'#/$defs//T'}
+        rt.references_resolve(self.turn['task']['output_schema'])
 
 if __name__=='__main__':unittest.main()
