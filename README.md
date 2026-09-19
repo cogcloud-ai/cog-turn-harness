@@ -88,9 +88,13 @@ to 8121 (cog-claude) and 8122 (cog-chatgpt).
 deliberately under the context-cog caller's 180 s) is the END-TO-END deadline,
 counted from the moment a request is accepted: the wait for the turn lock, the
 vendor readiness commands (each capped at 15 s, or at whatever is left) and the
-vendor command itself all draw on the same remaining time. `--queue-wait`
-(default 60 s) is the longest a second request may wait for the lock, and the
-budget shortens it — queueing can never eat the time the turn needs.
+vendor command itself all draw on the same remaining time. It is **one absolute
+instant**, passed from the moment of acceptance through the disconnect probe,
+the revalidation and the vendor call alike; what remains is computed where it is
+used, and no stage starts a fresh clock from a duration measured earlier.
+`--queue-wait` (default 60 s) is the longest a second request may wait for the
+lock, and the budget shortens it — queueing can never eat the time the turn
+needs.
 `--min-inference` (default 30 s) is what a turn needs to be worth starting: when
 less than that remains, the answer is `503 busy` and **no turn is spent**.
 
@@ -130,14 +134,19 @@ never a dropped connection, and never a traceback:
 
 Nothing reaches the vendor until the whole request has passed every one of these
 checks. **Every deadline is a total, not a gap between packets.** Headers get
-10 s, the body gets 10 s, and each response gets 30 s to be written; what remains
-is re-armed on the socket before every single receive, so a client that drips one
-byte at a time is cut off on schedule instead of holding a slot indefinitely, and
-a connected client that stops reading its response is dropped at the write
-deadline and its slot returned. The one failure that gets no answer at all is a
-client that never finishes sending its headers: there is no request to answer and
-the connection is closed silently. Everything else — failures raised by the
-inherited HTTP parser included — is the same JSON `error` object.
+10 s, the body gets 10 s, and one response gets 30 s to be written — headers,
+any interim responses and the body **together**, not 30 s apiece; what remains
+is re-armed on the socket before every single receive and before every single
+send, so a client that drips one byte at a time is cut off on schedule instead
+of holding a slot indefinitely, and a connected client that stops reading its
+response is dropped at the write deadline and its slot returned. Two failures
+get no usable HTTP response: a client that never finishes sending its headers
+(there is no request to answer, and the connection is closed silently), and a
+request line the inherited parser reads as HTTP/0.9 — two words, no version,
+as in `GET /health` — for which HTTP defines no status line or headers at all,
+so the JSON error object is written as a bare body. Everything else — failures
+raised by the inherited HTTP parser included — is the same JSON `error` object
+with a status line.
 
 One request is answered without a turn, and it has an exact signature: **no
 `response_format`, `max_tokens: 1`, and `messages` exactly
@@ -165,11 +174,20 @@ Honestly:
 - **A caller that walks away is not spent on twice — and a half-closed client is
   still a client.** Before a queued request starts a turn the gateway asks
   whether anybody is still there, and it asks by *writing* (an interim
-  `100 Continue`, which every HTTP client skips), because end of file on the
-  *request* side only means the caller finished sending. A caller counts as gone
-  when the socket reports an error or a write fails, and only then; otherwise the
-  result it paid for is delivered. A turn whose caller really did leave finishes,
-  and its result is **discarded and logged** — no second response is attempted.
+  `100 Continue`, which an HTTP/1.1 client must skip), because end of file on
+  the *request* side only means the caller finished sending. A caller counts as
+  gone when the socket reports an error or a write fails, and only then;
+  otherwise the result it paid for is delivered. A turn whose caller really did
+  leave finishes, and its result is **discarded and logged** — no second
+  response is attempted.
+  **Detecting a disconnect is best effort, not a guarantee.** Sending is not
+  delivery: two writes can both succeed and a reset arrive afterwards, so an
+  abandoned request can still spend a turn — the check makes that unlikely, not
+  impossible, and the 50 ms between the two probe writes is an empirical
+  loopback allowance. The probe is sent **only to an HTTP/1.1 caller**: HTTP
+  forbids a 1xx to an HTTP/1.0 client, which has no rule for reading one, so
+  that caller is treated as present — the same direction the whole check errs
+  in.
 - **Restart after any rebind.** The gateway runs outside the workbench host, so
   **revocation there does not reach a running gateway**. Binding documents and
   the token are read once at start (working rule 6).
@@ -219,9 +237,11 @@ locality, feature and pinning constraints, credential filtering, context/schema
 checks, command controls, version changes and schema fallback. The gateway
 suite adds the transport boundary — mandatory token and exactly one
 `Authorization` header, Host allowlist, Origin, media type, total header, body
-and write deadlines exercised with trickling and stalled clients, the connection
-limit, one end-to-end budget shared by queueing, readiness and inference, an
-abandoned queue entry, a half-closed caller that still receives its result and a
+and write deadlines exercised with trickling and stalled clients (including one
+write window shared by headers, interim responses and body), the connection
+limit, one absolute deadline travelling through probing, revalidation and
+inference, an abandoned queue entry, a half-closed caller that still receives
+its result under both HTTP/1.1 (probed) and HTTP/1.0 (never sent a 1xx), and a
 caller that leaves mid-turn — and drives the REAL context-cog caller
 (`cog_core.invoke` and `health`) against a live loopback server with the vendor
 replaced, skipping with a message when no context Cog sits beside the package. See the suite's
@@ -249,9 +269,9 @@ siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `5ba0b76f11fe6ecfe853d13f8209a2e48cc9b26fe5257e3fe95b25535ec5326e`
-- `src/turn_gateway.py` — `3d0e749bd9a1defafb5284e3908ff05345128cddaef34bcbde5a80d097b0166b`
-- `tests/test_gateway.py` — `a19d8dac32ca8f71b0f17094b42ce4b48cb6dfe75b7eedda370db44bafd84163`
-- `tests/test_provider.py` — `f0f7b43e2d25a648ca9061e6a21733ab841b23612f1c9b5d41179e868796b9c4`
+- `src/turn_runtime.py` — `753d71a6dceeb59aa9d47c97582585995ece4b1ec3ac4e88a2f969015f726365`
+- `src/turn_gateway.py` — `021cd6b4af4b33cbca2f61ba824bf359c1e8869f3023a04d33e85caf32463fd5`
+- `tests/test_gateway.py` — `7f41d4f3ae31f3dfd81ab4fb592c85f5e9d9b46ba7f934a7fb1d79f1e7b7048b`
+- `tests/test_provider.py` — `78005ac98ac629b6b3dbf92f657b4ab0bbf0301f4118c6136008a3a232103ac3`
 
 Official integration references are in `docs/sources.md`.

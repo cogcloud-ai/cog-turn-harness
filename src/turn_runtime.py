@@ -276,7 +276,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def infer_model(request, model_binding, timeout=None):
+def infer_model(request, model_binding, timeout=None, deadline=None):
+    # ONE absolute deadline travels; the duration is taken at the point of use.
+    if deadline is None and timeout is not None:
+        deadline = time.monotonic() + timeout
     from urllib.parse import urlsplit
     address = model_binding['invocation']['address']
     parsed = urlsplit(address)
@@ -294,7 +297,8 @@ def infer_model(request, model_binding, timeout=None):
     req = urllib.request.Request(address.rstrip('/') + '/chat/completions', json.dumps(body).encode(),
                                  {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
     try:
-        with urllib.request.build_opener(NoRedirect).open(req, timeout=MODEL_SECONDS if timeout is None else timeout) as response:
+        left = remaining_budget(deadline, 'the model request')
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=MODEL_SECONDS if left is None else left) as response:
             raw = response.read(MAX_BYTES + 1)
         require(len(raw) <= MAX_BYTES, 'Model response exceeded limit.')
         data = json.loads(raw)
@@ -310,11 +314,15 @@ def infer_model(request, model_binding, timeout=None):
     return result, {'gateway': facts}
 
 
-def infer_vendor(request, binding, timeout=None):
+def infer_vendor(request, binding, timeout=None, deadline=None):
     engine = ENGINE['engine']
-    # `timeout` is the WHOLE remaining budget for this turn, readiness included.
-    timeout = VENDOR_SECONDS if timeout is None else timeout
-    deadline = time.monotonic() + timeout
+    # ONE absolute monotonic deadline for the whole turn, readiness included.
+    # A caller that passes `deadline` has already started the clock — before
+    # its own disconnect probe and before `turn()` revalidated — and this stage
+    # must not restart it from a duration captured back then (review 14).
+    # `timeout` remains for direct callers with no deadline of their own.
+    if deadline is None:
+        deadline = time.monotonic() + (VENDOR_SECONDS if timeout is None else timeout)
     status = doctor(deadline)
     require(status['version'] == binding['harness']['version'], 'Vendor harness version changed; rebind before invoking.')
     prompt = '\n\n'.join(x['content'] for x in request['context']) + '\n\nTASK DATA:\n' + request['task']['input']
@@ -438,13 +446,18 @@ def native_schema(schema, top=True):
     return True
 
 
-def turn(request, binding, model_binding=None, timeout=None):
-    """`timeout` is what remains of ONE end-to-end budget for this request:
-    readiness commands and the vendor command both draw on it, and neither
-    starts once it is gone."""
+def turn(request, binding, model_binding=None, timeout=None, deadline=None):
+    """`deadline` is the request's ONE absolute monotonic instant; `timeout` is
+    the same budget stated as a duration, for callers that have not started a
+    clock. Everything after this point — this revalidation, the readiness
+    commands and the vendor command — draws on it, and nothing starts once it
+    is gone. Deriving the deadline HERE, before the revalidation, is what keeps
+    the check from being free (review 14)."""
+    if deadline is None and timeout is not None:
+        deadline = time.monotonic() + timeout
     check_turn(request, binding, model_binding)
-    result, observations = (infer_model(request, model_binding, timeout) if ENGINE['engine'] == 'openai-compatible'
-                            else infer_vendor(request, binding, timeout))
+    result, observations = (infer_model(request, model_binding, deadline=deadline) if ENGINE['engine'] == 'openai-compatible'
+                            else infer_vendor(request, binding, deadline=deadline))
     payload = {'document_kind': 'harness_turn_result', 'contract': CONTRACT, 'request_id': request['request_id'],
                'binding': request['binding'], 'model_binding': request['model_binding'], 'result': result, 'tool_uses': []}
     validate(payload, 'harness_turn_result')

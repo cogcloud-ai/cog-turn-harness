@@ -181,6 +181,36 @@ class ProviderTests(unittest.TestCase):
             rt.infer_vendor(self.turn,binding,timeout=5)
         self.assertLess(seen['timeout'],4.9,'readiness time must come out of the same budget')
         self.assertGreater(seen['timeout'],4.0)
+    def test_one_deadline_travels_through_revalidation_and_readiness(self):
+        """§12: the gateway hands `turn()` an absolute instant, and every stage
+        after it charges the SAME clock. `infer_vendor` used to be handed a
+        duration measured before the disconnect probe and to start a fresh
+        deadline from it AFTER `turn()` had revalidated, so probing and
+        checking were free. An injected clock makes the arithmetic exact and
+        makes this test sleep for nothing."""
+        class Clock:
+            def __init__(self): self.now=1000.0
+            def monotonic(self): return self.now
+            def spend(self,seconds): self.now+=seconds
+        clock=Clock()
+        binding=copy.deepcopy(self.binding);binding['model']={'id':'synthetic-model','revision':None,'digest':None}
+        seen={}
+        def check_turn(request,bound,model_binding=None): clock.spend(3)   # revalidation
+        def doctor(deadline=None): clock.spend(1);return {'version':'test-cli 1'}   # readiness
+        def command(argv,prompt,cwd,timeout=None):
+            seen['timeout']=timeout
+            return json.dumps({'type':'result','subtype':'success','is_error':False,
+                               'result':json.dumps({'ready':True})})
+        with patch.dict(rt.ENGINE,{'engine':'claude'}),patch.object(rt,'time',clock),\
+             patch.object(rt,'check_turn',side_effect=check_turn),\
+             patch.object(rt,'doctor',side_effect=doctor),\
+             patch.object(rt,'vendor_executable',return_value='/fake/vendor'),\
+             patch.object(rt,'command',side_effect=command):
+            # A caller that has already started its clock hands the instant on.
+            rt.turn(self.turn,binding,None,deadline=clock.monotonic()+10)
+        self.assertEqual(seen['timeout'],6.0,
+                         'the vendor command must get the budget MINUS the 3 s '
+                         'revalidation and the 1 s readiness, not a fresh clock')
     def test_a_reference_is_checked_with_the_resolver_that_will_resolve_it(self):
         # An empty pointer component names an empty-string key: the real
         # resolver says no, and so must the precheck.

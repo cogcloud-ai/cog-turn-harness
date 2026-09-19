@@ -50,10 +50,12 @@ CONTEXT_ID = 'system'
 # The exact body `cog_core.health(deep=True)` sends, and nothing else.
 LIVENESS_MESSAGES = [{'role': 'user', 'content': 'ping'}]
 LIVENESS_KEYS = {'model', 'messages', 'max_tokens'}
-# An interim response every HTTP client must skip: the gateway's way of asking
-# a socket whether anybody is still there (see Requests.client_gone).
+# An interim response an HTTP/1.1 client must skip: the gateway's way of asking
+# a socket whether anybody is still there (see Requests.client_gone). HTTP
+# forbids sending 1xx to an HTTP/1.0 client, so that caller is never probed.
 INTERIM = b'HTTP/1.1 100 Continue\r\n\r\n'
-PROBE_PAUSE = 0.05       # long enough on loopback for a reset to come back
+PROBE_VERSION = 'HTTP/1.1'
+PROBE_PAUSE = 0.05       # long enough on loopback for a reset to USUALLY come back
 # Inherited HTTP failures, answered as JSON error objects like every other one.
 INHERITED_CODES = {400: 'unsupported_request', 404: 'not_found', 408: 'request_timeout',
                    411: 'unsupported_request', 414: 'request_too_large',
@@ -98,6 +100,46 @@ class Clocked(io.RawIOBase):
             raise TimeoutError('read deadline elapsed')
         self.connection.settimeout(remaining)
         return self.connection.recv_into(buffer)
+
+
+class Deadlined(io.RawIOBase):
+    """A response writer under ONE deadline for the WHOLE response.
+
+    Headers, any interim responses and the body draw on the same window: the
+    remainder is re-armed on the socket before every send, and a long body is
+    sent in pieces so that the aggregate — not each write separately — is what
+    the deadline bounds. Giving each write its own full allowance (which is
+    what a plain `settimeout` per write does) bounds no total at all: a reader
+    that takes just under the limit for every piece holds the slot for as long
+    as there are pieces.
+    """
+
+    def __init__(self, connection, clock=time.monotonic):
+        self.connection, self.clock, self.deadline = connection, clock, None
+
+    def writable(self):
+        return True
+
+    def disarm(self):
+        self.deadline = None
+
+    def arm(self, seconds):
+        """Start the window if it is not already running. The first write of a
+        response — an interim probe included — is what starts it."""
+        if self.deadline is None:
+            self.deadline = self.clock() + seconds
+        return self.deadline
+
+    def write(self, data):
+        view = memoryview(data)
+        written = len(view)
+        while view:
+            remaining = None if self.deadline is None else self.deadline - self.clock()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError('write deadline elapsed')
+            self.connection.settimeout(remaining)
+            view = view[self.connection.send(view):]
+        return written
 
 
 class GatewayError(Exception):
@@ -290,11 +332,16 @@ def pong(binding):
                       'model_identity_verified': False, 'evidence_scope': 'composed-system'}}
 
 
-def perform(request, binding, model_binding, timeout):
+def perform(request, binding, model_binding, deadline):
     """One validated request = one turn. Turn faults are 502 with the provider's
-    own error code, never a fabricated completion."""
+    own error code, never a fabricated completion.
+
+    `deadline` is the request's ONE absolute monotonic instant, not a duration:
+    it travels into the turn so that the revalidation and the readiness
+    commands are charged to the same budget as the vendor command, and no stage
+    restarts the clock from a duration captured earlier."""
     try:
-        response = rt.turn(request, binding, model_binding, timeout)
+        response = rt.turn(request, binding, model_binding, deadline=deadline)
     except (ValueError, OSError, TypeError, KeyError) + rt.REFERENCE_ERRORS as exc:
         if isinstance(exc, ValueError):
             detail = str(exc)
@@ -399,22 +446,27 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
 
         def setup(self):
             super().setup()
-            # Every read on this connection now runs against a total deadline.
+            # Every read on this connection now runs against a total deadline,
+            # and every write of one response against a single other one.
             self.clock = Clocked(self.connection, header_seconds)
             self.rfile = io.BufferedReader(self.clock)
+            self.writes = Deadlined(self.connection)
+            self.wfile = self.writes
 
         def handle_one_request(self):
             self.answered = False
             self.budget = None
             self.clock.start(header_seconds)
+            self.writes.disarm()
             super().handle_one_request()
 
         def respond(self, status, value):
             """Writing is deadlined too: a connected client that stops reading
-            would otherwise hold a slot for as long as it liked."""
+            would otherwise hold a slot for as long as it liked. The window is
+            ONE per response — headers, interim responses and body together."""
             data = json.dumps(value, allow_nan=False).encode()
             self.answered = True  # set first: never a second response attempt
-            self.connection.settimeout(write_seconds)
+            self.writes.arm(write_seconds)
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
@@ -525,15 +577,27 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
             return b''.join(chunks)
 
         def client_gone(self):
-            """Has the caller really gone? End of file on the REQUEST side does
-            not say so: a client may half-close its sending direction and go on
-            reading, and this platform reports the same readable/hang-up
-            condition for that as for a socket whose owner has left. The only
-            honest question is whether a write still reaches somebody, so ask it
-            with an interim response every HTTP client skips: a peer that has
-            gone resets the first one and the second write fails. A reader too
-            slow to drain is still a reader — that is the write deadline's
-            business, not this one's."""
+            """Has the caller probably gone? BEST EFFORT, and deliberately
+            biased towards delivering: end of file on the REQUEST side does not
+            say the reader left — a client may half-close its sending direction
+            and go on reading, and this platform reports the same
+            readable/hang-up condition for that as for a socket whose owner has
+            left. The nearest honest question is whether a write still reaches
+            somebody, so an HTTP/1.1 caller is asked with an interim response
+            it must skip: a peer that has gone usually resets the first one and
+            the second write fails.
+
+            It is a HEURISTIC, not a proof. Sending is not delivery: two writes
+            can both succeed and a reset arrive afterwards, so an abandoned
+            request can still spend a turn. The 50 ms between them is an
+            empirical loopback allowance, not a guarantee.
+
+            An HTTP/1.0 caller is never probed: HTTP forbids 1xx to it, and a
+            correct HTTP/1.0 client that half-closes would be handed something
+            it has no rule for reading. It counts as present, which is the same
+            direction this whole check errs in. A reader too slow to drain is
+            still a reader — that is the write deadline's business, not this
+            one's."""
             try:
                 poller = select.poll()
                 poller.register(self.connection, select.POLLIN)
@@ -544,10 +608,13 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                     return True
                 if self.connection.recv(1, socket.MSG_PEEK):
                     return False                              # unread bytes, not EOF
-                self.connection.settimeout(write_seconds)
-                self.connection.sendall(INTERIM)
+                if self.request_version != PROBE_VERSION:
+                    return False                              # no 1xx to an HTTP/1.0 client
+                # The probe writes are part of this response's one window.
+                self.writes.arm(write_seconds)
+                self.wfile.write(INTERIM)
                 time.sleep(PROBE_PAUSE)
-                self.connection.sendall(INTERIM)
+                self.wfile.write(INTERIM)
                 return False
             except (TimeoutError, socket.timeout):
                 return False
@@ -605,7 +672,9 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
         def complete(self, request):
             """One turn at a time, and every wait drawn from the one budget: a
             turn is started only if enough of the request's own deadline is
-            left to finish it, and a caller that has gone is never spent on."""
+            left to finish it, and a caller that has (probably) gone is not
+            spent on. `self.budget` is an absolute monotonic instant and is
+            passed on as one; `remaining` is computed at each point of use."""
             remaining = self.budget - time.monotonic()
             wait = min(queue_wait, remaining - min_inference)
             if wait <= 0:
@@ -625,7 +694,10 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                                     f'{min_inference:g} s minimum; no turn was started.')
                 if self.client_gone():
                     return self.drop(request, 'left while queued; no turn was started')
-                result = perform(request, binding, model_binding, remaining)
+                # The absolute deadline travels, not the duration measured
+                # above: the probe just spent part of it, and the revalidation
+                # inside the turn will spend more.
+                result = perform(request, binding, model_binding, self.budget)
             finally:
                 one_turn.release()
             # The turn is already paid for. If the caller has gone, it is

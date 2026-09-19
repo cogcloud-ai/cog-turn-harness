@@ -39,7 +39,7 @@ def admitted():
 
 
 def fake_turn(result=None,observations=None,before=None):
-    def turn(request,binding,model_binding=None,timeout=None):
+    def turn(request,binding,model_binding=None,timeout=None,deadline=None):
         rt.check_turn(request,binding,model_binding)
         if before is not None: before(request)
         payload={'document_kind':'harness_turn_result','contract':rt.CONTRACT,'request_id':request['request_id'],
@@ -197,9 +197,9 @@ class ServerTestCase(unittest.TestCase):
               'response_format':{'type':'json_schema','json_schema':{'name':'cog_output','strict':True,'schema':SCHEMA}}}
         body.update(overrides);return body
     def post(self,body=None,content_type='application/json',length=None,host=None,
-             token=TOKEN,path='/v1/chat/completions'):
+             token=TOKEN,path='/v1/chat/completions',version='HTTP/1.1'):
         raw=json.dumps(body).encode() if body is not None else b''
-        head=f'POST {path} HTTP/1.1\r\nHost: {host or "127.0.0.1:"+str(self.port)}\r\n'
+        head=f'POST {path} {version}\r\nHost: {host or "127.0.0.1:"+str(self.port)}\r\n'
         if token: head+=f'Authorization: Bearer {token}\r\n'
         head+=f'Content-Type: {content_type}\r\n'
         head+=f'Content-Length: {len(raw) if length is None else length}\r\n\r\n'
@@ -230,7 +230,7 @@ class SurfaceTests(ServerTestCase):
         self.assertTrue(x['request_id']);self.assertIsNotNone(x['provider_observations'])
     def test_system_becomes_context_and_the_user_message_is_the_task_input(self):
         seen={}
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             seen.update(request);return fake_turn()(request,binding,model_binding)
         with patch.object(rt,'turn',side_effect=turn):
             call(self.base,'/v1/chat/completions',self.completion_body())
@@ -248,12 +248,16 @@ class SurfaceTests(ServerTestCase):
         """Not the flag value: what remains of this request's own budget once
         the transport and the queue have had their share."""
         seen={}
-        def turn(request,binding,model_binding=None,timeout=None):
-            seen['timeout']=timeout;return fake_turn()(request,binding,model_binding)
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
+            # An absolute instant, not a duration: what is LEFT of it here is
+            # what the turn may spend (§12).
+            seen['left']=deadline-time.monotonic();seen['timeout']=timeout
+            return fake_turn()(request,binding,model_binding)
         with patch.object(rt,'turn',side_effect=turn):
             call(self.base,'/v1/chat/completions',self.completion_body())
-        self.assertLessEqual(seen['timeout'],gw.TURN_SECONDS)
-        self.assertGreater(seen['timeout'],gw.TURN_SECONDS-10)
+        self.assertIsNone(seen['timeout'],'the gateway passes a deadline, never a duration')
+        self.assertLessEqual(seen['left'],gw.TURN_SECONDS)
+        self.assertGreater(seen['left'],gw.TURN_SECONDS-10)
     def test_temperature_and_max_tokens_are_ignored(self):
         with patch.object(rt,'turn',side_effect=fake_turn()):
             status,_=call(self.base,'/v1/chat/completions',self.completion_body(temperature=0.7,max_tokens=32))
@@ -506,7 +510,7 @@ class RefusalTests(ServerTestCase):
         self.refused(response_format={'type':'json_schema','json_schema':{'name':'x','strict':True,
                      'schema':{'type':'object','$ref':'https://example.com/s.json'}}})
     def test_failed_turn_is_502_never_a_completion(self):
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             raise ValueError('Vendor harness version changed; rebind before invoking.')
         with patch.object(rt,'turn',side_effect=turn):
             status,body=call(self.base,'/v1/chat/completions',self.completion_body())
@@ -559,7 +563,7 @@ class SerializationTests(ServerTestCase):
     def test_one_turn_at_a_time(self):
         live,overlap=[],[]
         lock=threading.Lock()
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             with lock:
                 live.append(1)
                 if len(live)>1: overlap.append(1)
@@ -580,7 +584,7 @@ class QueueTestCase(ServerTestCase):
     def held_turn(self,release,started,calls):
         """A turn that blocks until the test lets it go, so the second request
         is genuinely waiting on the lock."""
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             calls.append(request['request_id'])
             started.set()
             release.wait(20)
@@ -608,7 +612,11 @@ class QueueTests(QueueTestCase):
 
 class AbandonedQueueTests(QueueTestCase):
     queue_wait=30  # long: the caller leaving, not the deadline, must end this
-    def test_an_abandoned_queue_entry_never_spends_a_turn(self):
+    def test_an_abandoned_queue_entry_is_usually_dropped_before_a_turn(self):
+        """Best effort, and named as such (§12): the disconnect check is a
+        heuristic — two successful writes do not prove a reader — so this
+        establishes that a caller which HAS left is detected here, not that one
+        can never slip through."""
         release,started,calls=threading.Event(),threading.Event(),[]
         log=io.StringIO()
         with patch.object(rt,'turn',side_effect=self.held_turn(release,started,calls)),\
@@ -620,7 +628,7 @@ class AbandonedQueueTests(QueueTestCase):
             waiting.close()
             release.set();first.join(20)
             time.sleep(0.5)
-        self.assertEqual(len(calls),1,'a caller that left while queued must not spend a turn')
+        self.assertEqual(len(calls),1,'a caller that left while queued should not spend a turn')
         self.assertIn('left while queued',log.getvalue())
 
 
@@ -632,8 +640,10 @@ class BudgetTests(QueueTestCase):
     min_inference=1
     def test_the_queue_wait_is_bounded_by_what_the_budget_leaves(self):
         release,started,calls,seen=threading.Event(),threading.Event(),[],{}
-        def turn(request,binding,model_binding=None,timeout=None):
-            seen['timeout']=timeout
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
+            # The gateway hands on the request's absolute deadline, not a
+            # duration captured before the disconnect probe (§12).
+            seen['left']=deadline-time.monotonic()
             return self.held_turn(release,started,calls)(request,binding,model_binding)
         with patch.object(rt,'turn',side_effect=turn):
             first=self.occupy(release,started,calls)
@@ -648,8 +658,8 @@ class BudgetTests(QueueTestCase):
         self.assertGreater(elapsed,self.turn_timeout-self.min_inference-0.5)
         self.assertIn('budget',body['error']['message'])
         # And the running turn was given the budget, not the flag's own value.
-        self.assertLessEqual(seen['timeout'],self.turn_timeout)
-        self.assertGreater(seen['timeout'],0)
+        self.assertLessEqual(seen['left'],self.turn_timeout)
+        self.assertGreater(seen['left'],0)
 
 
 class ExhaustedBudgetTests(ServerTestCase):
@@ -681,7 +691,7 @@ class ExhaustedBudgetTests(ServerTestCase):
 class DisconnectTests(ServerTestCase):
     def test_a_turn_whose_caller_left_finishes_and_is_discarded(self):
         started,finished=threading.Event(),threading.Event()
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             started.set()
             time.sleep(0.6)
             response=fake_turn()(request,binding,model_binding)
@@ -730,6 +740,90 @@ class HalfCloseTests(ServerTestCase):
         self.assertNotIn('discarded',log.getvalue())
 
 
+    def drain(self,sock,seconds=20):
+        data=b'';sock.settimeout(seconds)
+        while b'\r\n\r\n' not in data or not data.split(b'\r\n\r\n')[-1].endswith(b'}'):
+            chunk=sock.recv(65536)
+            if not chunk: break
+            data+=chunk
+        return data
+    def half_closed_request(self,version):
+        """Send a complete request, close the sending direction only, read."""
+        with patch.object(rt,'turn',side_effect=fake_turn({'answer':'delivered'})):
+            sock=socket.create_connection(('127.0.0.1',self.port),timeout=20)
+            self.addCleanup(sock.close)
+            sock.sendall(self.post(self.completion_body(),version=version))
+            sock.shutdown(socket.SHUT_WR)
+            return self.drain(sock)
+    def test_an_http_1_1_half_close_is_probed_with_an_interim_response(self):
+        """The probe is legitimate for HTTP/1.1: such a client must parse and
+        skip a 1xx, and the two writes are how the gateway asks whether anybody
+        is still reading."""
+        data=self.half_closed_request('HTTP/1.1')
+        self.assertIn(b'HTTP/1.1 100 Continue',data,data[:200])
+        status,body=final_response(data)
+        self.assertEqual(status,200,data[:200])
+        self.assertEqual(json.loads(body['choices'][0]['message']['content']),{'answer':'delivered'})
+    def test_an_http_1_0_caller_is_never_sent_a_1xx(self):
+        """HTTP forbids an informational response to an HTTP/1.0 client, which
+        has no rule for reading one (§12). That caller is treated as present —
+        the direction this check errs in anyway — and simply gets its result."""
+        data=self.half_closed_request('HTTP/1.0')
+        self.assertNotIn(b' 100 ',data,data[:200])
+        self.assertNotIn(b'Continue',data,data[:200])
+        status,body=final_response(data)
+        self.assertEqual(status,200,data[:200])
+        self.assertEqual(json.loads(body['choices'][0]['message']['content']),{'answer':'delivered'})
+
+
+class WriteWindowTests(unittest.TestCase):
+    """§12: headers, interim responses and the body share ONE write deadline.
+
+    A `settimeout` per write bounds each write and no total: a reader that
+    takes just under the limit for every piece holds its slot for as long as
+    there are pieces. Driven here against a fake socket and an injected clock,
+    so the arithmetic is exact and nothing waits."""
+    class Clock:
+        def __init__(self): self.now=1000.0
+        def monotonic(self): return self.now
+        def spend(self,seconds): self.now+=seconds
+    class Peer:
+        """A socket that takes one byte per send, and charges for it."""
+        def __init__(self,clock,cost=0.4):
+            self.clock,self.cost,self.sent,self.armed=clock,cost,b'',[]
+        def settimeout(self,value): self.armed.append(value)
+        def send(self,view):
+            self.clock.spend(self.cost);self.sent+=bytes(view[:1]);return 1
+    def writer(self,cost=0.4):
+        clock=self.Clock();peer=self.Peer(clock,cost)
+        return clock,peer,gw.Deadlined(peer,clock=clock.monotonic)
+    def test_the_aggregate_is_bounded_not_each_write(self):
+        _,peer,writer=self.writer()
+        writer.arm(1.0)
+        writer.write(b'ab')                      # 0.8 s of the one window
+        with self.assertRaises(TimeoutError): writer.write(b'cd')
+        self.assertEqual(peer.sent,b'abc',
+                         'a fourth byte went out after the window had closed')
+        for armed,expected in zip(peer.armed,[1.0,0.6,0.2]):
+            self.assertAlmostEqual(armed,expected,places=6,
+                                   msg='the socket timeout was reset to the full '
+                                       'allowance instead of what remains')
+        self.assertEqual(len(peer.armed),3)
+    def test_a_second_arm_does_not_extend_the_window(self):
+        """An interim probe arms it; the response that follows must not push
+        the same window out again."""
+        clock,peer,writer=self.writer(cost=0.0)
+        writer.arm(1.0);opened=writer.deadline
+        clock.spend(0.9)
+        self.assertEqual(writer.arm(1.0),opened)
+        writer.write(b'x')
+        self.assertAlmostEqual(peer.armed[-1],0.1,places=6)
+    def test_disarming_starts_the_next_response_fresh(self):
+        clock,_,writer=self.writer(cost=0.0)
+        writer.arm(1.0);clock.spend(5);writer.disarm()
+        self.assertEqual(writer.arm(1.0),clock.monotonic()+1.0)
+
+
 class StalledReaderTests(ServerTestCase):
     connections=1
     write_seconds=0.5
@@ -737,7 +831,7 @@ class StalledReaderTests(ServerTestCase):
         """A connected client that never drains the socket would otherwise hold
         its slot for as long as it liked. Eight of those is the whole gateway."""
         reached=threading.Event()
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             # One replacement for both requests: a result too big for any
             # socket buffer only for the one the stalled client sent.
             huge='STALL' in request['task']['input']
@@ -804,7 +898,7 @@ class CallerTests(ServerTestCase):
         self.assertFalse([p for p in envelope['problems'] if p['check']=='schema'],envelope['problems'])
     def test_the_caller_sends_the_context_the_gateway_maps_to_the_turn(self):
         seen={}
-        def turn(request,binding,model_binding=None,timeout=None):
+        def turn(request,binding,model_binding=None,timeout=None,deadline=None):
             seen.update(copy.deepcopy(request))
             return fake_turn(self.example_result())(request,binding,model_binding)
         with patch.object(rt,'turn',side_effect=turn):
