@@ -824,6 +824,32 @@ class WriteWindowTests(unittest.TestCase):
         self.assertEqual(writer.arm(1.0),clock.monotonic()+1.0)
 
 
+class HalfCloseLongTurnTests(ServerTestCase):
+    """Codex review 15: the interim probe armed the write window, the turn ran
+    inside it, and a half-closed caller's paid result was discarded when the
+    turn outlasted the window."""
+    write_seconds=0.5
+    def test_a_turn_longer_than_the_write_window_is_still_delivered(self):
+        log=io.StringIO()
+        with patch.object(rt,'turn',side_effect=fake_turn(
+                {'answer':'delivered late'},before=lambda request: time.sleep(1.5))),\
+             contextlib.redirect_stderr(log):
+            sock=socket.create_connection(('127.0.0.1',self.port),timeout=20)
+            self.addCleanup(sock.close)
+            sock.sendall(self.post(self.completion_body()))
+            sock.shutdown(socket.SHUT_WR)
+            data=b'';sock.settimeout(20)
+            while b'\r\n\r\n' not in data or not data.split(b'\r\n\r\n')[-1].endswith(b'}'):
+                chunk=sock.recv(65536)
+                if not chunk: break
+                data+=chunk
+        self.assertIn(b'HTTP/1.1 100 Continue',data,data[:200])
+        status,body=final_response(data)
+        self.assertEqual(status,200,data[:300])
+        self.assertEqual(json.loads(body['choices'][0]['message']['content']),{'answer':'delivered late'})
+        self.assertNotIn('discarded',log.getvalue())
+
+
 class StalledReaderTests(ServerTestCase):
     connections=1
     write_seconds=0.5

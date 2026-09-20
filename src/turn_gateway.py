@@ -610,11 +610,18 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                     return False                              # unread bytes, not EOF
                 if self.request_version != PROBE_VERSION:
                     return False                              # no 1xx to an HTTP/1.0 client
-                # The probe writes are part of this response's one window.
+                # The probe's writes are bounded, and its window ENDS with the
+                # probe: the turn runs between here and the final response, and
+                # a window left armed would spend itself on inference time and
+                # discard a paid result (Codex review 15). The final response
+                # arms its own.
                 self.writes.arm(write_seconds)
-                self.wfile.write(INTERIM)
-                time.sleep(PROBE_PAUSE)
-                self.wfile.write(INTERIM)
+                try:
+                    self.wfile.write(INTERIM)
+                    time.sleep(PROBE_PAUSE)
+                    self.wfile.write(INTERIM)
+                finally:
+                    self.writes.disarm()
                 return False
             except (TimeoutError, socket.timeout):
                 return False

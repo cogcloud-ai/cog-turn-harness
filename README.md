@@ -270,8 +270,8 @@ siblings are present, and skips when none are.
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
 - `src/turn_runtime.py` — `753d71a6dceeb59aa9d47c97582585995ece4b1ec3ac4e88a2f969015f726365`
-- `src/turn_gateway.py` — `021cd6b4af4b33cbca2f61ba824bf359c1e8869f3023a04d33e85caf32463fd5`
-- `tests/test_gateway.py` — `7f41d4f3ae31f3dfd81ab4fb592c85f5e9d9b46ba7f934a7fb1d79f1e7b7048b`
+- `src/turn_gateway.py` — `a4d61b04f2fe314cfb766546cbac0614dadcdded6c5883bef283160fcb5f5811`
+- `tests/test_gateway.py` — `6e4c90655bd13cdbb1e70fb4a00f4e0207582d2bd1aae9e2be09abd227ee69d4`
 - `tests/test_provider.py` — `78005ac98ac629b6b3dbf92f657b4ab0bbf0301f4118c6136008a3a232103ac3`
 
 Official integration references are in `docs/sources.md`.
