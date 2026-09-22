@@ -115,3 +115,10 @@ installable without requiring a sibling repository at runtime.
 Runtime SHA-256: `f8ecf8215d2b153234a24d60f021c61a5d7a02a5b32825d36c7a20664b988849`
 
 Official integration references are in `docs/sources.md`.
+
+## License
+
+Copyright 2026 OpenTeams. Licensed under the [Apache License 2.0](LICENSE).
+Third-party dependencies and external model services retain their own licenses
+and terms. Previously published BSD-3-Clause versions remain available under
+that license.

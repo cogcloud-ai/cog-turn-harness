@@ -3,7 +3,7 @@ id: openteams/cog-turn-harness
 version: 0.1.0
 summary: Runs one JSON interaction against an independently bound model.
 owner: trent@openteams.com
-license: BSD-3-Clause
+license: Apache-2.0
 kind: context
 memory: none
 prohibits:
