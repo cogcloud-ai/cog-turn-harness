@@ -5,3 +5,9 @@ state/
 runs/
 .env
 model.json
+# Local installation and execution state
+.DS_Store
+.env.*
+!.env.example
+.op-composition.json
+var/

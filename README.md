@@ -269,9 +269,21 @@ siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `753d71a6dceeb59aa9d47c97582585995ece4b1ec3ac4e88a2f969015f726365`
+- `src/turn_runtime.py` — `3308ea33883e40e2cd9a899f6de1fd9fed5831ba9a31e4281e86fae1f430914b`
 - `src/turn_gateway.py` — `a4d61b04f2fe314cfb766546cbac0614dadcdded6c5883bef283160fcb5f5811`
 - `tests/test_gateway.py` — `6e4c90655bd13cdbb1e70fb4a00f4e0207582d2bd1aae9e2be09abd227ee69d4`
-- `tests/test_provider.py` — `78005ac98ac629b6b3dbf92f657b4ab0bbf0301f4118c6136008a3a232103ac3`
+- `tests/test_provider.py` — `cca4167124ac09b3779757ba88a9ddd7983dfb673aeca66ad090b5cef479f5cc`
 
 Official integration references are in `docs/sources.md`.
+
+## License
+
+Copyright 2026 OpenTeams. Licensed under the [Apache License 2.0](LICENSE).
+Third-party dependencies and external model services retain their own licenses
+and terms. Previously published BSD-3-Clause versions remain available under
+that license.
+
+## Public preview
+
+See the [suite guide](https://github.com/cogcloud-ai/cog-op-builder/blob/main/docs/repositories.md)
+for repository roles, supported setup, and current limitations.

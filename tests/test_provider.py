@@ -40,6 +40,12 @@ class ProviderTests(unittest.TestCase):
         value=rt.candidate(self.request,lambda:{'version':'test-cli 1'})
         self.assertEqual(value['binding']['state'],'candidate');self.assertIsNone(value['binding']['admission'])
         rt.validate(value,'bind_result')
+    def test_readiness_can_accept_stderr_only_status(self):
+        value=rt.command([sys.executable,'-c','import sys; sys.stderr.write("Logged in using ChatGPT")'],include_stderr=True)
+        self.assertIn('ChatGPT',value)
+    def test_combined_readiness_output_is_bounded(self):
+        with patch.object(rt,'MAX_BYTES',8), self.assertRaisesRegex(ValueError,'exceeded'):
+            rt.command([sys.executable,'-c','import sys; sys.stdout.write("1234"); sys.stderr.write("56789")'],include_stderr=True)
     def test_composition_boundary(self):
         self.request['requirement']['accepted_compositions']=['model']
         with self.assertRaises(ValueError):rt.candidate(self.request,lambda:{'version':'test'})

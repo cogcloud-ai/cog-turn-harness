@@ -3,7 +3,7 @@ type: cog [0.1]
 name: cog-turn-harness
 description: Runs one JSON interaction against an independently bound model.
 version: "0.1.0"
-license: BSD-3-Clause
+license: Apache-2.0
 publisher: OpenTeams
 manifest: cog.yaml
 manifest_schema: openteams/cog-manifest [0.1]

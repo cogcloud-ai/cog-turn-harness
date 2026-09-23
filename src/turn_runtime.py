@@ -109,13 +109,14 @@ def command(argv, prompt=None, cwd=None, timeout=VENDOR_SECONDS, include_stderr=
         output.seek(0)
         data = output.read(MAX_BYTES + 1)
         require(len(data) <= MAX_BYTES, 'Vendor response exceeded the supported size.')
+        if include_stderr:
+            errors.seek(0)
+            data += errors.read(MAX_BYTES + 1)
+            require(len(data) <= MAX_BYTES, 'Vendor response exceeded the supported size.')
         if not data.strip():
             errors.seek(0)
             tail = errors.read(MAX_BYTES).decode('utf-8', 'replace')[-800:].strip()
             raise ValueError('Vendor CLI returned no output' + ('; stderr: ' + tail if tail else '.'))
-        if include_stderr:
-            errors.seek(0)
-            data += errors.read(MAX_BYTES)
         return data.decode('utf-8')
 
 
