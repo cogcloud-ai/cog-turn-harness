@@ -37,6 +37,13 @@
           "binding_id",
           "revision"
         ]
+      },
+      "locality": {
+        "enum": [
+          "local",
+          "cloud"
+        ],
+        "default": "cloud"
       }
     },
     "required": [
@@ -63,6 +70,7 @@
     ],
     "model_id": null,
     "allowed_localities": [
+      "local",
       "cloud"
     ],
     "evidence_level": "declaration",

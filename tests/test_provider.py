@@ -88,12 +88,32 @@ class ProviderTests(unittest.TestCase):
             result=rt.turn(self.turn,self.binding,self.model)
         self.assertTrue(result['ok']);rt.validate(result['payload'],'harness_turn_result')
         self.assertEqual(result['binding'],self.binding);self.assertEqual(result['payload']['model_binding'],self.binding['model_binding'])
+    def test_local_gateway_uses_only_its_declared_credential(self):
+        model=copy.deepcopy(self.model)
+        if model is None:
+            model=json.loads((ROOT/'tests/model-binding.json').read_text())
+        model['provider']={'id':'openteams/cog-qwen','version':'0.1.0'}
+        model['invocation']={'protocol':'openai-chat-completions-v1','address':'http://127.0.0.1:8114/bindings/local/1/v1'}
+        model['credential_refs']={'gateway_token':'env:COG_QWEN_TOKEN'}
+        data={'model':model['model']['id'],'choices':[{'message':{'content':'{"ready":true}'}}],
+              'cog_binding':{'binding_id':model['binding_id'],'revision':model['revision'],'outcome':'completed','deviations':[]}}
+        from unittest.mock import MagicMock
+        response=MagicMock();response.__enter__.return_value.read.return_value=json.dumps(data).encode()
+        opener=MagicMock();opener.open.return_value=response
+        with patch.dict(os.environ,{'COG_QWEN_TOKEN':'local-test-token'}),patch.object(rt.urllib.request,'build_opener',return_value=opener):
+            result,_=rt.infer_model(self.turn,model)
+            self.assertEqual(result,{'ready':True})
+            self.assertEqual(opener.open.call_args.args[0].get_header('Authorization'),'Bearer local-test-token')
+            model['credential_refs']['gateway_token']='env:OPENROUTER_COG_TOKEN'
+            with self.assertRaisesRegex(ValueError,'credential reference'):rt.infer_model(self.turn,model)
+
     def test_parser_error_does_not_echo_secret(self):
         result=rt.envelope('turn',error='Vendor failed')
         self.assertFalse(result['ok']);self.assertIsNone(result['payload'])
     def test_vendored_schema_matches_profile(self):
-        profile=ROOT.parent/'cog-manifest-openteams/schemas/satisfier-binding.schema.json'
-        if profile.exists():self.assertEqual((ROOT/'contracts/satisfier-binding.schema.json').read_bytes(),profile.read_bytes())
+        profile=ROOT.parent/'cog-openrouter/contracts/satisfier-binding.schema.json'
+        self.assertTrue(profile.is_file(), 'Bootstrap the public suite first.')
+        self.assertEqual((ROOT/'contracts/satisfier-binding.schema.json').read_bytes(),profile.read_bytes())
 
 
     def test_vendor_command_controls_and_schema_fallback(self):

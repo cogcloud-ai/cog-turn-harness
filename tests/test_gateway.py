@@ -27,9 +27,8 @@ import turn_gateway as gw
 
 SCHEMA={'type':'object','properties':{'answer':{'type':'string'}},'required':['answer'],'additionalProperties':False}
 TOKEN='test-token-0123456789abcdef0123456789abcdef'
-# Optional real-caller check against a legacy context Cog (an internal package,
-# not part of the suite); the tests skip when it is not checked out beside this one.
-CALLER=ROOT.parent/'cog-issue-classifier'
+# The manifest-listed author package supplies the real context caller.
+CALLER=ROOT.parent/'cog-author'
 
 
 def admitted():
@@ -895,16 +894,10 @@ class StalledReaderTests(ServerTestCase):
 class CallerTests(ServerTestCase):
     """The real context-cog caller, not a hand-copied request body."""
     def setUp(self):
-        if not (CALLER/'src/cog_core.py').is_file():
-            self.skipTest(f'{CALLER.name} (optional legacy package, not part of the suite) '
-                          f'is not beside this package; the real-caller path is unverified '
-                          f'in this checkout')
+        self.assertTrue((CALLER/'src/cog_core.py').is_file(), 'Bootstrap the public suite before running integration tests.')
         sys.path.insert(0,str(CALLER/'src'))
-        try:
-            import cog_core
-        except ImportError as exc:                       # pragma: no cover
-            self.skipTest(f'{CALLER.name} could not be imported ({exc}); the real-caller '
-                          f'path is unverified in this environment')
+        self.addCleanup(sys.path.remove, str(CALLER/'src'))
+        import cog_core
         self.core=cog_core
         super().setUp()
         # Its binding comes from model.json; point the module at this server.

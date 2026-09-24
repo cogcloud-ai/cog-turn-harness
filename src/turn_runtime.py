@@ -178,7 +178,8 @@ def candidate(request, inspect=doctor):
     composition = CARD['compositions'][0]
     require(req['capability'] == CARD['capability'] and composition in req['accepted_compositions'], 'Incompatible capability or composition.')
     require(set(req['features']) <= set(ENGINE['features']), 'Unsupported interaction features.')
-    require('cloud' in req['allowed_localities'], 'This reference requires cloud processing permission.')
+    locality = config.get('locality', 'cloud') if composition == 'harness' else 'cloud'
+    require(locality in req['allowed_localities'], 'The configured processing locality is not permitted.')
     require(not req['identity_verified'] and not req['revision_pinned'], 'Immutable model identity cannot be attested by this provider.')
     require(req['evidence_level'] == 'declaration', 'This reference advertises declaration evidence only; host conformance tests are separate.')
     if composition == 'model+harness':
@@ -192,7 +193,7 @@ def candidate(request, inspect=doctor):
         'capability': CARD['capability'], 'features': req['features'], 'composition': composition,
         'model': {'id': config['model_id'], 'revision': None, 'digest': None} if composition == 'model+harness' else None,
         'harness': {'id': ENGINE['harness_id'], 'version': status['version'], 'configuration_digest': 'sha256:' + digest(config)},
-        'model_binding': config.get('model_binding'), 'locality': 'cloud',
+        'model_binding': config.get('model_binding'), 'locality': locality,
         'invocation': {'protocol': 'cog-harness-turn-command-v1', 'address': 'cog-command:turn'},
         'qualification': {'level': 'declaration', 'identity_verified': False, 'revision_pinned': False,
             'evidence': [{'check': 'adapter-controls', 'observation': 'CLI/version and subscription login inspected; no model-quality or immutable-weights claim.' if composition == 'model+harness' else 'Single-turn JSON interaction with no tools or memory; external model admission required.'}]},
@@ -265,6 +266,7 @@ def check_turn(request, binding, model_binding=None):
     require(output_schema.get('type') == 'object', 'Object output schema required.')
     if binding['composition'] == 'harness':
         validate(model_binding, 'binding')
+        require(model_binding['locality'] == binding['locality'], 'Harness locality differs from its model binding.')
         require(model_binding['state'] == 'admitted' and model_binding['composition'] == 'model', 'Separate model must be admitted and model-only.')
         require({'binding_id': model_binding['binding_id'], 'revision': model_binding['revision']} == binding['model_binding'], 'Separate model reference mismatch.')
         require(model_binding['capability'] == 'model-endpoint/openai-compatible' and
@@ -288,8 +290,11 @@ def infer_model(request, model_binding, timeout=None, deadline=None):
             'Reference harness accepts only a host-admitted loopback model gateway.')
     require(model_binding['invocation']['protocol'] == 'openai-chat-completions-v1', 'Unsupported model protocol.')
     reference = model_binding['credential_refs'].get('gateway_token')
-    require(reference == 'env:OPENROUTER_COG_TOKEN', 'Reference harness requires the OpenRouter gateway credential reference.')
-    token = os.environ.get('OPENROUTER_COG_TOKEN')
+    approved = {'openteams/cog-openrouter': 'env:OPENROUTER_COG_TOKEN',
+                'openteams/cog-qwen': 'env:COG_QWEN_TOKEN'}
+    require(reference is not None and reference == approved.get(model_binding['provider']['id']),
+            'Unsupported model provider or gateway credential reference.')
+    token = os.environ.get(reference[4:])
     require(bool(token) and '\n' not in token and '\r' not in token, 'Model gateway credential is unavailable.')
     schema = request['task']['output_schema']
     messages = [{'role': 'system', 'content': '\n\n'.join(x['content'] for x in request['context'])},

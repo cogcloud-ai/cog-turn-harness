@@ -271,10 +271,10 @@ siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `3308ea33883e40e2cd9a899f6de1fd9fed5831ba9a31e4281e86fae1f430914b`
-- `src/turn_gateway.py` — `a4d61b04f2fe314cfb766546cbac0614dadcdded6c5883bef283160fcb5f5811`
-- `tests/test_gateway.py` — `6e4c90655bd13cdbb1e70fb4a00f4e0207582d2bd1aae9e2be09abd227ee69d4`
-- `tests/test_provider.py` — `cca4167124ac09b3779757ba88a9ddd7983dfb673aeca66ad090b5cef479f5cc`
+- `src/turn_runtime.py` — `6171a9b33c6447afd47e7c1a716f893fd307f8e87df737134652aa071527ab93`
+- `src/turn_gateway.py` — `69e42639e9377c828ca7a0893916de762849cdc57616aeedea6e78aacf682a16`
+- `tests/test_gateway.py` — `07033aa18cf12333ee61db943e347dd4340ca248341a104400a124d8c84735a1`
+- `tests/test_provider.py` — `e4cc906d2f499d6257f6548326c38241be21519404a3e4e6569f2a558be3e6b0`
 
 Official integration references are in `docs/sources.md`.
 
@@ -289,3 +289,11 @@ that license.
 
 See the [suite guide](https://github.com/cogcloud-ai/cog-op-builder/blob/main/docs/repositories.md)
 for repository roles, supported setup, and current limitations.
+
+The gateway integration tests use the manifest-listed cog-author caller; bootstrap
+the public suite before running them. No private sibling fixtures are required.
+
+For a local model, use `configuration.locality: local` and a local admitted
+model binding from cog-qwen. The requirement must permit local processing.
+Workbench and the runtime reject a harness whose locality differs from its model.
+Omitting locality preserves the existing cloud configuration default.
