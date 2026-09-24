@@ -27,6 +27,8 @@ import turn_gateway as gw
 
 SCHEMA={'type':'object','properties':{'answer':{'type':'string'}},'required':['answer'],'additionalProperties':False}
 TOKEN='test-token-0123456789abcdef0123456789abcdef'
+# Optional real-caller check against a legacy context Cog (an internal package,
+# not part of the suite); the tests skip when it is not checked out beside this one.
 CALLER=ROOT.parent/'cog-issue-classifier'
 
 
@@ -825,7 +827,7 @@ class WriteWindowTests(unittest.TestCase):
 
 
 class HalfCloseLongTurnTests(ServerTestCase):
-    """Codex review 15: the interim probe armed the write window, the turn ran
+    """Internal review finding: the interim probe armed the write window, the turn ran
     inside it, and a half-closed caller's paid result was discarded when the
     turn outlasted the window."""
     write_seconds=0.5
@@ -894,8 +896,9 @@ class CallerTests(ServerTestCase):
     """The real context-cog caller, not a hand-copied request body."""
     def setUp(self):
         if not (CALLER/'src/cog_core.py').is_file():
-            self.skipTest(f'{CALLER.name} is not beside this package; the real-caller '
-                          f'path is unverified in this checkout')
+            self.skipTest(f'{CALLER.name} (optional legacy package, not part of the suite) '
+                          f'is not beside this package; the real-caller path is unverified '
+                          f'in this checkout')
         sys.path.insert(0,str(CALLER/'src'))
         try:
             import cog_core

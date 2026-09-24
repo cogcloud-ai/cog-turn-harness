@@ -320,7 +320,7 @@ def infer_vendor(request, binding, timeout=None, deadline=None):
     # ONE absolute monotonic deadline for the whole turn, readiness included.
     # A caller that passes `deadline` has already started the clock — before
     # its own disconnect probe and before `turn()` revalidated — and this stage
-    # must not restart it from a duration captured back then (review 14).
+    # must not restart it from a duration captured back then (internal review finding).
     # `timeout` remains for direct callers with no deadline of their own.
     if deadline is None:
         deadline = time.monotonic() + (VENDOR_SECONDS if timeout is None else timeout)
@@ -453,7 +453,7 @@ def turn(request, binding, model_binding=None, timeout=None, deadline=None):
     clock. Everything after this point — this revalidation, the readiness
     commands and the vendor command — draws on it, and nothing starts once it
     is gone. Deriving the deadline HERE, before the revalidation, is what keeps
-    the check from being free (review 14)."""
+    the check from being free (internal review finding)."""
     if deadline is None and timeout is not None:
         deadline = time.monotonic() + timeout
     check_turn(request, binding, model_binding)

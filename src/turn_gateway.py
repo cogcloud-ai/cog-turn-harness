@@ -613,7 +613,7 @@ def make_server(binding, model_binding=None, port=None, host=LOOPBACK,
                 # The probe's writes are bounded, and its window ENDS with the
                 # probe: the turn runs between here and the final response, and
                 # a window left armed would spend itself on inference time and
-                # discard a paid result (Codex review 15). The final response
+                # discard a paid result (found in an internal review). The final response
                 # arms its own.
                 self.writes.arm(write_seconds)
                 try:

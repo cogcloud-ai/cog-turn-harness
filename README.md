@@ -244,11 +244,13 @@ inference, an abandoned queue entry, a half-closed caller that still receives
 its result under both HTTP/1.1 (probed) and HTTP/1.0 (never sent a 1xx), and a
 caller that leaves mid-turn — and drives the REAL context-cog caller
 (`cog_core.invoke` and `health`) against a live loopback server with the vendor
-replaced, skipping with a message when no context Cog sits beside the package. See the suite's
-`docs/verification-2026-09-07.md` for live-test status. No live quality claim is
+replaced, skipping with a message when no context Cog sits beside the package. See
+[Workbench's verification status](https://github.com/cogcloud-ai/cog-workbench/blob/main/docs/verification-2026-09-07.md)
+for live-test status. No live quality claim is
 made by these tests.
 
-Core/profile package check from the CogLab workspace:
+Core/profile package check, with [cog-smith](https://github.com/cogcloud-ai/cog-smith)
+checked out beside this package:
 
 ```sh
 ../cog-smith/.pixi/envs/default/bin/python ../cog-smith/src/cogsmith_cli.py check .
