@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: cogcloud-ai/cog-op-builder
+          # Published byte-identical shared-source companions.
+          ref: 92834ebeb71c956a84b497d0d452b22e6ea1e417
           path: workspace/cog-op-builder
           persist-credentials: false
       - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
