@@ -1021,7 +1021,13 @@ class NativeSchemaTests(unittest.TestCase):
 
 class CopyTests(unittest.TestCase):
     SIBLINGS=('cog-claude','cog-chatgpt','cog-turn-harness')
-    SHARED=('src/turn_gateway.py','src/turn_runtime.py','tests/test_gateway.py','tests/test_provider.py')
+    SHARED=('src/turn_gateway.py','src/turn_runtime.py','tests/test_gateway.py','tests/test_provider.py','scripts/qualify_provider.py','tests/test_qualification.py')
+    def test_readme_hashes_match_shared_sources(self):
+        import hashlib
+        text=(ROOT/'README.md').read_text()
+        for name in self.SHARED:
+            self.assertIn('`'+name+'` — `'+hashlib.sha256((ROOT/name).read_bytes()).hexdigest()+'`',text)
+
     def test_shared_sources_are_byte_identical_across_providers(self):
         checked=0
         for name in self.SHARED:

@@ -102,7 +102,11 @@ def command(argv, prompt=None, cwd=None, timeout=VENDOR_SECONDS, include_stderr=
         try:
             proc.communicate((prompt or '').encode(), timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                if proc.poll() is None:
+                    proc.kill()
             proc.wait()
             raise ValueError('Vendor CLI timed out; no result accepted.') from None
         require(proc.returncode == 0, 'Vendor CLI failed; check its installation and subscription login directly.')

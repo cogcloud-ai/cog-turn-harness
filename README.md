@@ -266,14 +266,14 @@ not apply; the dedicated provider tests validate the custom implementation.
 byte-for-byte into the two subscription repositories. Update all copies
 together; the engine and provider declaration are package-specific. This keeps
 each Cog independently installable without requiring a sibling repository at
-runtime. `tests/test_gateway.py` enforces all four copies against whichever
+runtime. `tests/test_gateway.py` enforces all six copies against whichever
 siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `6171a9b33c6447afd47e7c1a716f893fd307f8e87df737134652aa071527ab93`
+- `src/turn_runtime.py` — `1ce204c6c10f3fcb65fc1cec7b58ad1dd7347626c3734be5e24df413ac4b34bb`
 - `src/turn_gateway.py` — `69e42639e9377c828ca7a0893916de762849cdc57616aeedea6e78aacf682a16`
-- `tests/test_gateway.py` — `b6c9ea461a57682aa0e6dffc29e0e591e423cff614a30bb9c6f527470cdc5ff7`
+- `tests/test_gateway.py` — `e89cc830557bc7ed7ffaa46b6077a8ec9d557f9d360f7eb8a4c9244c6c66ac99`
 - `tests/test_provider.py` — `e4cc906d2f499d6257f6548326c38241be21519404a3e4e6569f2a558be3e6b0`
 
 Official integration references are in `docs/sources.md`.
@@ -304,5 +304,5 @@ See [qualification](docs/qualification.md) for exact model selection, the versio
 
 Shared qualification sources owned in cog-turn-harness:
 
-- `scripts/qualify_provider.py` — `362f01c79787c25c1d86e52383c5730387d21defaf3cb132191f6016ad5aaf09`
-- `tests/test_qualification.py` — `8d4f03ce68d083b7efef07bf6aed1e35be84b28b187ed8c2eac75d31db028aaa`
+- `scripts/qualify_provider.py` — `e05241dd6af6c1d421db100a070b3b48c1b2bef090b0ab7bd5461ed0a70a571c`
+- `tests/test_qualification.py` — `9d270170d18df05e8a8365465eaeeb789fa9dbe5f64d51ec9d18308df1750f34`

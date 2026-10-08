@@ -14,6 +14,14 @@ sys.path.insert(0,str(ROOT/'src'))
 import turn_runtime as rt
 
 
+def package_digest(root):
+    paths = [root/name for name in ('cog.yaml','pixi.toml','engine.json','model-artifact.json') if (root/name).is_file()]
+    for name in ('src','scripts','context','binding','contracts'):
+        if (root/name).is_dir():
+            paths += [p for p in (root/name).rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc']
+    values = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
+    return hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+
 def qualify(binding, model, run_live=False):
     rt.require(run_live, 'Live qualification requires --run-live; it may spend two subscription turns.')
     rt.require(rt.ENGINE['engine'] in ('codex','claude'), 'Qualification is for subscription adapters only.')
@@ -24,7 +32,7 @@ def qualify(binding, model, run_live=False):
             'date':datetime.now(timezone.utc).isoformat(), 'platform':{'system':platform.system(),'machine':platform.machine()},
             'python':platform.python_version(), 'requested_model':model,'model_identity_verified':False,
             'binding':{'binding_id':binding['binding_id'],'revision':binding['revision']},
-            'adapter_sha256':hashlib.sha256((ROOT/'src/turn_runtime.py').read_bytes()).hexdigest(),
+            'adapter_sha256':package_digest(ROOT),
             'checks':[], 'scope':'Installed CLI and composed-system observations; no model-quality, weights, vendor-tool or OS-isolation attestation.'}
     def observe(name, function):
         started=time.monotonic()
@@ -53,15 +61,14 @@ def qualify(binding, model, run_live=False):
     observe('native-structured-output',structured)
     observe('open-schema-local-validation',lambda:structured(True))
     def timeout():
-        # Launch the real installed CLI without inference, then also prove that
-        # an expired turn deadline refuses before a model result is accepted.
+        # Deterministic local supervisor check; no live inference is interrupted.
         terminated = False
-        try:rt.command([rt.vendor_executable(), '--version'], timeout=.001)
+        try:rt.command([sys.executable, '-c', 'import time;time.sleep(30)'], timeout=.05)
         except ValueError as exc:terminated = 'timed out' in str(exc)
         try:rt.turn(request,binding,deadline=time.monotonic()-1)
         except ValueError as exc:return terminated and ('timed out' in str(exc) or 'budget' in str(exc))
         return False
-    observe('live-cli-timeout-and-expired-turn-deadline',timeout)
+    observe('local-process-timeout-and-expired-turn-deadline',timeout)
     def refused():
         denied=copy.deepcopy(request);denied['tool_grant_refs']=['qualification-unsupported-grant']
         try:rt.check_turn(denied,binding)
@@ -77,17 +84,25 @@ def main(argv=None):
     parser.add_argument('--binding',required=True);parser.add_argument('--model',required=True)
     parser.add_argument('--output',required=True);parser.add_argument('--run-live',action='store_true')
     args=parser.parse_args(argv)
+    output = Path(args.output)
+    claimed = False
+    started = False
     try:
-        # Do not spend any turns before discovering an output collision.
-        output=Path(args.output)
-        rt.require(not output.exists() and not output.is_symlink(),'Choose a new qualification report path.')
+        rt.require(args.run_live, 'Live qualification requires --run-live.')
         value=rt.read(args.binding);binding=value.get('binding',value)
-        report=qualify(binding,args.model,args.run_live)
-        with output.open('x',encoding='utf-8') as stream:json.dump(report,stream,indent=2);stream.write('\n')
+        rt.require(isinstance(value.get('package_sha256'), str) and value['package_sha256']==package_digest(ROOT), 'Supply a current Workbench admission record for this package.')
+        with output.open('x',encoding='utf-8') as stream:
+            claimed = True
+            started = True
+            report=qualify(binding,args.model,args.run_live)
+            json.dump(report,stream,indent=2);stream.write('\n')
         print(json.dumps({'passed':report['passed'],'report':str(output)}))
         return 0 if report['passed'] else 1
     except Exception:
-        print(json.dumps({'passed':False,'error':'Qualification preflight failed. Supply a current admitted subscription binding, exact model, new output path and --run-live. Inspect login/CLI directly; no raw diagnostics are exported.'}))
+        if claimed:
+            output.unlink(missing_ok=True)
+        stage = 'Qualification failed after starting checks.' if started else 'Qualification preflight failed.'
+        print(json.dumps({'passed':False,'error':stage+' Supply a current Workbench admission record, matching requested model, writable new output path and --run-live. Inspect login/CLI directly; no raw diagnostics are exported.'}))
         return 1
 
 if __name__=='__main__':raise SystemExit(main())

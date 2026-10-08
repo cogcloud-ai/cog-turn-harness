@@ -42,7 +42,7 @@ before a turn. The procedure neither logs in nor admits/rebinds itself.
 
 The checks cover authentication and controls on the exact bound version, native
 closed-object structured output, open-schema prompt output with local full-schema
-validation, an actual CLI version command interrupted by a very short timeout plus an
+validation, a deterministic local supervisor timeout plus an
 already expired turn deadline refused without inference,
 and unsupported tool-grant refusal before inference. The last is the adapter's
 refusal boundary; it does not attest vendor safety-policy refusal, and a synthetic
@@ -70,3 +70,12 @@ Official references: [Codex CLI](https://developers.openai.com/codex/cli/referen
 [Claude CLI](https://code.claude.com/docs/en/cli-reference),
 [Claude authentication](https://code.claude.com/docs/en/authentication).
 Local `--help`, `--version` and readiness were inspected for the matrix above.
+
+The timeout probe terminates a deterministic local Python process and refuses
+an already-expired turn deadline. It does not interrupt live model inference.
+The requested model must match the binding; moving aliases (for example sonnet)
+remain aliases and actual model identity is unverified. Reports fingerprint the
+complete behavior file set; the CLI requires a current Workbench record with a
+matching package digest. This detects stale packages, not forged local admission.
+Output is exclusively created before checks so missing/unwritable parents refuse
+before any subscription turn.
