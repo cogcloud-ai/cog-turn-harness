@@ -39,5 +39,5 @@ class QualificationTests(unittest.TestCase):
         def turn(request,binding,timeout=None,deadline=None):
             if deadline is not None or timeout<1:raise ValueError('timed out; no result accepted')
             return {'ok':True,'payload':{'result':{'ready':True},'tool_uses':[]}}
-        with patch.object(rt,'doctor',return_value={'version':'fake-cli'}),patch.object(rt,'turn',side_effect=turn),patch.object(rt,'command',side_effect=ValueError('timed out; no result accepted')):report=module.qualify(binding,binding['model']['id'],True)
+        with patch.object(rt,'doctor',return_value={'version':'fake-cli'}),patch.object(rt,'turn',side_effect=turn),patch.object(rt,'command',side_effect=ValueError('timed out; no result accepted')),patch.object(rt,'vendor_executable',return_value='fake-cli'):report=module.qualify(binding,binding['model']['id'],True)
         self.assertTrue(report['passed']);self.assertEqual(len(report['checks']),5)

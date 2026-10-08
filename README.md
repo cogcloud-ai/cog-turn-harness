@@ -273,7 +273,7 @@ SHA-256 of the shared sources, for an integrity check from outside the package:
 
 - `src/turn_runtime.py` — `6171a9b33c6447afd47e7c1a716f893fd307f8e87df737134652aa071527ab93`
 - `src/turn_gateway.py` — `69e42639e9377c828ca7a0893916de762849cdc57616aeedea6e78aacf682a16`
-- `tests/test_gateway.py` — `07033aa18cf12333ee61db943e347dd4340ca248341a104400a124d8c84735a1`
+- `tests/test_gateway.py` — `b6c9ea461a57682aa0e6dffc29e0e591e423cff614a30bb9c6f527470cdc5ff7`
 - `tests/test_provider.py` — `e4cc906d2f499d6257f6548326c38241be21519404a3e4e6569f2a558be3e6b0`
 
 Official integration references are in `docs/sources.md`.
@@ -305,4 +305,4 @@ See [qualification](docs/qualification.md) for exact model selection, the versio
 Shared qualification sources owned in cog-turn-harness:
 
 - `scripts/qualify_provider.py` — `362f01c79787c25c1d86e52383c5730387d21defaf3cb132191f6016ad5aaf09`
-- `tests/test_qualification.py` — `3c580146a82b51576d99419d1a8af6a4c3cc71ec48326007272def54ad327665`
+- `tests/test_qualification.py` — `8d4f03ce68d083b7efef07bf6aed1e35be84b28b187ed8c2eac75d31db028aaa`
