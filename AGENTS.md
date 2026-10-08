@@ -6,3 +6,5 @@ Refuse browser-shaped requests before anything else (Host allowlist, any Origin,
 System messages become the turn's context and the user message alone is task.input, so the rendered prompt matches the workbench host.
 Never self-admit, copy login secrets, bypass vendor permissions, or claim bare-model evidence for subscriptions.
 Run the deterministic tests and Smith package checks after changes.
+
+`scripts/qualify_provider.py` and `tests/test_qualification.py` are also owned in cog-turn-harness and copied byte-identically to both subscription Cogs.

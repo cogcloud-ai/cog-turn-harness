@@ -11,6 +11,7 @@ pyyaml = "*"
 jsonschema = "*"
 
 [tasks]
+qualify = "python scripts/qualify_provider.py"
 turn = "python src/turn_runtime.py turn"
 bind = "python src/turn_runtime.py bind"
 card = "python src/turn_runtime.py card"

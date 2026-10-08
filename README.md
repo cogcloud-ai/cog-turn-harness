@@ -297,3 +297,12 @@ For a local model, use `configuration.locality: local` and a local admitted
 model binding from cog-qwen. The requirement must permit local processing.
 Workbench and the runtime reject a harness whose locality differs from its model.
 Omitting locality preserves the existing cloud configuration default.
+
+## Opt-in provider qualification
+
+See [qualification](docs/qualification.md) for exact model selection, the version/platform matrix, sanitized report format and live authentication, structured-output, deadline and refusal checks. `qualify` never admits a binding or exports login/model output. It refuses harness-only providers.
+
+Shared qualification sources owned in cog-turn-harness:
+
+- `scripts/qualify_provider.py` — `35c78da4ab620814483e8ed009be31e9643aee306ce0e6562a4b39dd50391b24`
+- `tests/test_qualification.py` — `cfaca6e51de2633e1b8d575d8d32b40d9c07443f033dc01dc40335ff9c7660fe`
