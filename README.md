@@ -304,5 +304,5 @@ See [qualification](docs/qualification.md) for exact model selection, the versio
 
 Shared qualification sources owned in cog-turn-harness:
 
-- `scripts/qualify_provider.py` — `35c78da4ab620814483e8ed009be31e9643aee306ce0e6562a4b39dd50391b24`
-- `tests/test_qualification.py` — `cfaca6e51de2633e1b8d575d8d32b40d9c07443f033dc01dc40335ff9c7660fe`
+- `scripts/qualify_provider.py` — `362f01c79787c25c1d86e52383c5730387d21defaf3cb132191f6016ad5aaf09`
+- `tests/test_qualification.py` — `3c580146a82b51576d99419d1a8af6a4c3cc71ec48326007272def54ad327665`

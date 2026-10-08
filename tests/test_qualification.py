@@ -30,14 +30,14 @@ class QualificationTests(unittest.TestCase):
     @unittest.skipIf(rt.ENGINE['engine']=='openai-compatible','Subscription qualification only')
     def test_results_export_no_vendor_output_or_exception(self):
         binding=self.binding()
-        with patch.object(rt,'doctor',return_value={'version':'fake-cli'}),patch.object(rt,'turn',side_effect=ValueError('PRIVATE_TOKEN and account@example.com')):
+        with patch.object(rt,'doctor',return_value={'version':'fake-cli'}),patch.object(rt,'turn',side_effect=ValueError('PRIVATE_TOKEN and account@example.com')),patch.object(rt,'command',side_effect=ValueError('timed out; no result accepted')):
             report=module.qualify(binding,binding['model']['id'],True)
         text=json.dumps(report);self.assertNotIn('PRIVATE_TOKEN',text);self.assertNotIn('account@example.com',text);self.assertFalse(report['passed'])
     @unittest.skipIf(rt.ENGINE['engine']=='openai-compatible','Subscription qualification only')
     def test_clean_output_timeout_and_refusal_have_explicit_results(self):
         binding=self.binding()
-        def turn(request,binding,timeout):
-            if timeout<1:raise ValueError('timed out; no result accepted')
+        def turn(request,binding,timeout=None,deadline=None):
+            if deadline is not None or timeout<1:raise ValueError('timed out; no result accepted')
             return {'ok':True,'payload':{'result':{'ready':True},'tool_uses':[]}}
-        with patch.object(rt,'doctor',return_value={'version':'fake-cli'}),patch.object(rt,'turn',side_effect=turn):report=module.qualify(binding,binding['model']['id'],True)
+        with patch.object(rt,'doctor',return_value={'version':'fake-cli'}),patch.object(rt,'turn',side_effect=turn),patch.object(rt,'command',side_effect=ValueError('timed out; no result accepted')):report=module.qualify(binding,binding['model']['id'],True)
         self.assertTrue(report['passed']);self.assertEqual(len(report['checks']),5)

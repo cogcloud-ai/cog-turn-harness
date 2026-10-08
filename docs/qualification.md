@@ -42,7 +42,8 @@ before a turn. The procedure neither logs in nor admits/rebinds itself.
 
 The checks cover authentication and controls on the exact bound version, native
 closed-object structured output, open-schema prompt output with local full-schema
-validation, an actual CLI command interrupted by a very short end-to-end budget,
+validation, an actual CLI version command interrupted by a very short timeout plus an
+already expired turn deadline refused without inference,
 and unsupported tool-grant refusal before inference. The last is the adapter's
 refusal boundary; it does not attest vendor safety-policy refusal, and a synthetic
 JSON reply is not an attestation of no internal vendor tools. Invalid output,

@@ -53,10 +53,15 @@ def qualify(binding, model, run_live=False):
     observe('native-structured-output',structured)
     observe('open-schema-local-validation',lambda:structured(True))
     def timeout():
-        try:rt.turn(request,binding,timeout=.001)
-        except ValueError as exc:return 'timed out' in str(exc) or 'budget' in str(exc)
+        # Launch the real installed CLI without inference, then also prove that
+        # an expired turn deadline refuses before a model result is accepted.
+        terminated = False
+        try:rt.command([rt.vendor_executable(), '--version'], timeout=.001)
+        except ValueError as exc:terminated = 'timed out' in str(exc)
+        try:rt.turn(request,binding,deadline=time.monotonic()-1)
+        except ValueError as exc:return terminated and ('timed out' in str(exc) or 'budget' in str(exc))
         return False
-    observe('live-cli-end-to-end-timeout',timeout)
+    observe('live-cli-timeout-and-expired-turn-deadline',timeout)
     def refused():
         denied=copy.deepcopy(request);denied['tool_grant_refs']=['qualification-unsupported-grant']
         try:rt.check_turn(denied,binding)
