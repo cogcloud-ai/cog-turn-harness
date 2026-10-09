@@ -300,9 +300,9 @@ Omitting locality preserves the existing cloud configuration default.
 
 ## Opt-in provider qualification
 
-See [qualification](docs/qualification.md) for exact model selection, the version/platform matrix, sanitized report format and live authentication, structured-output, deadline and refusal checks. `qualify` never admits a binding or exports login/model output. It refuses harness-only providers.
+See [qualification](docs/qualification.md) for exact model selection, the version/platform matrix, sanitized report format and live authentication and structured-output probes plus local deadline and refusal checks. `qualify` never admits a binding or exports login/model output. It refuses harness-only providers.
 
 Shared qualification sources owned in cog-turn-harness:
 
-- `scripts/qualify_provider.py` — `e05241dd6af6c1d421db100a070b3b48c1b2bef090b0ab7bd5461ed0a70a571c`
-- `tests/test_qualification.py` — `9d270170d18df05e8a8365465eaeeb789fa9dbe5f64d51ec9d18308df1750f34`
+- `scripts/qualify_provider.py` — `e9e69ce7b0676c87d8170bd11fc60b686153999ceb64f3bfe83be3cc0804fd63`
+- `tests/test_qualification.py` — `440f20eb523bc8350e3e84af058809ab10a164e1df95753504639d306fd70057`

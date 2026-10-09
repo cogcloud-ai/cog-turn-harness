@@ -22,7 +22,7 @@ def package_digest(root):
     values = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(paths)}
     return hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 
-def qualify(binding, model, run_live=False):
+def qualify(binding, model, run_live=False, on_start=None):
     rt.require(run_live, 'Live qualification requires --run-live; it may spend two subscription turns.')
     rt.require(rt.ENGINE['engine'] in ('codex','claude'), 'Qualification is for subscription adapters only.')
     rt.validate(binding,'binding')
@@ -35,6 +35,7 @@ def qualify(binding, model, run_live=False):
             'adapter_sha256':package_digest(ROOT),
             'checks':[], 'scope':'Installed CLI and composed-system observations; no model-quality, weights, vendor-tool or OS-isolation attestation.'}
     def observe(name, function):
+        if on_start is not None: on_start()
         started=time.monotonic()
         try: passed=function() is True
         except Exception: passed=False
@@ -87,22 +88,32 @@ def main(argv=None):
     output = Path(args.output)
     claimed = False
     started = False
+    written = False
+    def mark_started():
+        nonlocal started
+        started = True
     try:
         rt.require(args.run_live, 'Live qualification requires --run-live.')
-        value=rt.read(args.binding);binding=value.get('binding',value)
+        rt.require(not Path(args.binding).with_suffix('.revoked').exists(), 'Binding has been revoked.')
+        value=rt.read(args.binding)
+        checksum=value.pop('sha256', None)
+        expected=hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+        rt.require(checksum == expected, 'Workbench record integrity failure.')
+        binding=value.get('binding',value)
         rt.require(isinstance(value.get('package_sha256'), str) and value['package_sha256']==package_digest(ROOT), 'Supply a current Workbench admission record for this package.')
         with output.open('x',encoding='utf-8') as stream:
             claimed = True
-            started = True
-            report=qualify(binding,args.model,args.run_live)
+            report=qualify(binding,args.model,args.run_live,on_start=mark_started)
             json.dump(report,stream,indent=2);stream.write('\n')
+        written = True
         print(json.dumps({'passed':report['passed'],'report':str(output)}))
         return 0 if report['passed'] else 1
     except Exception:
-        if claimed:
-            output.unlink(missing_ok=True)
         stage = 'Qualification failed after starting checks.' if started else 'Qualification preflight failed.'
         print(json.dumps({'passed':False,'error':stage+' Supply a current Workbench admission record, matching requested model, writable new output path and --run-live. Inspect login/CLI directly; no raw diagnostics are exported.'}))
         return 1
+    finally:
+        if claimed and not written:
+            output.unlink(missing_ok=True)
 
 if __name__=='__main__':raise SystemExit(main())

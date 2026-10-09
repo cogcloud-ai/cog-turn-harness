@@ -79,3 +79,8 @@ complete behavior file set; the CLI requires a current Workbench record with a
 matching package digest. This detects stale packages, not forged local admission.
 Output is exclusively created before checks so missing/unwritable parents refuse
 before any subscription turn.
+
+The CLI verifies the Workbench record checksum and refuses its `.revoked`
+sidecar before checks. A checksum detects accidental edits, not forged local
+admission. Interrupted qualification removes the exclusively claimed report.
+Preflight failures remain labeled preflight until the first check starts.
