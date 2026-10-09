@@ -21,7 +21,7 @@ jobs:
         with:
           repository: cogcloud-ai/cog-op-builder
           # Published byte-identical shared-source companions.
-          ref: afc53b4f8fecf734c2a0530005de2b21f754979f
+          ref: 39527d75991730eb841ca1fe91caee315513bec5
           path: workspace/cog-op-builder
           persist-credentials: false
       - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
