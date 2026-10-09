@@ -271,7 +271,7 @@ siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `1ce204c6c10f3fcb65fc1cec7b58ad1dd7347626c3734be5e24df413ac4b34bb`
+- `src/turn_runtime.py` — `9101fa61feda9e1f18b92ca61b57b83b5211d6f5c2940b2e6013268bd1b3c373`
 - `src/turn_gateway.py` — `69e42639e9377c828ca7a0893916de762849cdc57616aeedea6e78aacf682a16`
 - `tests/test_gateway.py` — `e89cc830557bc7ed7ffaa46b6077a8ec9d557f9d360f7eb8a4c9244c6c66ac99`
 - `tests/test_provider.py` — `e4cc906d2f499d6257f6548326c38241be21519404a3e4e6569f2a558be3e6b0`
@@ -304,5 +304,5 @@ See [qualification](docs/qualification.md) for exact model selection, the versio
 
 Shared qualification sources owned in cog-turn-harness:
 
-- `scripts/qualify_provider.py` — `e9e69ce7b0676c87d8170bd11fc60b686153999ceb64f3bfe83be3cc0804fd63`
-- `tests/test_qualification.py` — `440f20eb523bc8350e3e84af058809ab10a164e1df95753504639d306fd70057`
+- `scripts/qualify_provider.py` — `6f40d76309d267af8e38f4473e6ffa4df61573befb00472328893f2d4f4d5a7d`
+- `tests/test_qualification.py` — `1dfcb7a5ea4d4fc6e44f1a9b3f7f62383ac479fca900b32981be314f39e36056`

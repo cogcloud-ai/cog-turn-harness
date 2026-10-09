@@ -84,3 +84,8 @@ The CLI verifies the Workbench record checksum and refuses its `.revoked`
 sidecar before checks. A checksum detects accidental edits, not forged local
 admission. Interrupted qualification removes the exclusively claimed report.
 Preflight failures remain labeled preflight until the first check starts.
+
+SIGINT and SIGTERM remove incomplete reports and terminate the supervised
+turn process group before returning. Already spent inference cannot be refunded;
+this avoids allowing the interrupted process to continue beside an immediate
+rerun. SIGKILL or host power loss cannot run cleanup.

@@ -3,6 +3,7 @@ import copy
 import hashlib
 import os
 import subprocess
+import signal
 import time
 import importlib.util
 import json
@@ -158,3 +159,46 @@ class QualificationTests(unittest.TestCase):
                 report=module.qualify(binding,binding['model']['id'],True)
             row=next(row for row in report['checks'] if row['check']=='local-process-timeout-and-expired-turn-deadline')
             self.assertFalse(row['passed']);self.assertFalse(report['passed'])
+
+    @unittest.skipIf(rt.ENGINE['engine']=='openai-compatible','Subscription qualification only')
+    def test_wrong_model_is_preflight_and_failure_after_first_check_is_started(self):
+        with tempfile.TemporaryDirectory() as folder:
+            record=Path(folder)/'binding.json';output=Path(folder)/'report.json';self.write_record(record)
+            argv=['--binding',str(record),'--model','wrong-model','--output',str(output),'--run-live']
+            with patch.object(rt,'doctor') as doctor,patch.object(rt,'command') as command,patch.object(rt,'turn') as turn,contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(module.main(argv),1)
+            self.assertIn('preflight failed',stdout.getvalue());doctor.assert_not_called();command.assert_not_called();turn.assert_not_called()
+            self.assertFalse(output.exists())
+            argv[argv.index('--model')+1]=self.binding()['model']['id']
+            with patch.object(rt,'doctor',return_value={'version':'stale'}) as doctor,patch.object(rt,'turn') as turn,patch.object(module.json,'dump',side_effect=ValueError('Synthetic report write failure')),contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(module.main(argv),1)
+            doctor.assert_called_once();turn.assert_not_called()
+            self.assertIn('after starting checks',stdout.getvalue());self.assertFalse(output.exists())
+
+    def test_sigint_and_sigterm_remove_report_and_stop_turn_process_group(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);record=root/'binding.json';self.write_record(record)
+            # Use the real command supervisor inside an independently started qualifier.
+            driver=root/'driver.py'
+            driver.write_text("import importlib.util,sys\nfrom pathlib import Path\nspec=importlib.util.spec_from_file_location('qualifier',sys.argv[1]);q=importlib.util.module_from_spec(spec);spec.loader.exec_module(q)\ndef slow(*args,**kwargs):\n    q.rt.command([sys.executable,'-c',sys.argv[4],sys.argv[3]],timeout=30)\nq.qualify=slow\nq.main(['--binding',sys.argv[2],'--model','test','--output',sys.argv[3]+'.report','--run-live'])\n")
+            child="import os,subprocess,sys,time;from pathlib import Path;p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);Path(sys.argv[1]).write_text(str(os.getpid())+' '+str(p.pid));time.sleep(30)"
+            for sig in (signal.SIGINT,signal.SIGTERM):
+                marker=root/('pids-'+str(sig));report=Path(str(marker)+'.report')
+                proc=subprocess.Popen([sys.executable,str(driver),str(ROOT/'scripts/qualify_provider.py'),str(record),str(marker),child],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                pids=[]
+                try:
+                    deadline=time.monotonic()+10
+                    while not marker.exists() and proc.poll() is None and time.monotonic()<deadline:time.sleep(.02)
+                    self.assertTrue(marker.exists(),'Synthetic turn did not start')
+                    pids=list(map(int,marker.read_text().split()))
+                    self.assertTrue(report.exists())
+                    proc.send_signal(sig);proc.wait(timeout=5)
+                    self.assertFalse(report.exists())
+                    for pid in pids:
+                        status=subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
+                        self.assertTrue(not status or status.startswith('Z'),status)
+                finally:
+                    if proc.poll() is None:proc.kill();proc.wait()
+                    for pid in pids:
+                        try:os.kill(pid,9)
+                        except ProcessLookupError:pass

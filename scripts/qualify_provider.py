@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import sys
 import time
 ROOT=Path(__file__).resolve().parents[1]
@@ -92,6 +93,9 @@ def main(argv=None):
     def mark_started():
         nonlocal started
         started = True
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+    previous_sigterm = signal.signal(signal.SIGTERM, interrupted)
     try:
         rt.require(args.run_live, 'Live qualification requires --run-live.')
         rt.require(not Path(args.binding).with_suffix('.revoked').exists(), 'Binding has been revoked.')
@@ -113,6 +117,7 @@ def main(argv=None):
         print(json.dumps({'passed':False,'error':stage+' Supply a current Workbench admission record, matching requested model, writable new output path and --run-live. Inspect login/CLI directly; no raw diagnostics are exported.'}))
         return 1
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         if claimed and not written:
             output.unlink(missing_ok=True)
 
