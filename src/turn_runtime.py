@@ -99,12 +99,21 @@ def command(argv, prompt=None, cwd=None, timeout=VENDOR_SECONDS, include_stderr=
                                     cwd=cwd, env=clean_env(), start_new_session=True)
         except OSError:
             raise ValueError('Vendor CLI is unavailable; install it and log in using its own login command.') from None
+        def terminate():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                if proc.poll() is None:
+                    proc.kill()
+            proc.wait()
         try:
             proc.communicate((prompt or '').encode(), timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            terminate()
             raise ValueError('Vendor CLI timed out; no result accepted.') from None
+        except BaseException:
+            terminate()
+            raise
         require(proc.returncode == 0, 'Vendor CLI failed; check its installation and subscription login directly.')
         output.seek(0)
         data = output.read(MAX_BYTES + 1)

@@ -266,14 +266,14 @@ not apply; the dedicated provider tests validate the custom implementation.
 byte-for-byte into the two subscription repositories. Update all copies
 together; the engine and provider declaration are package-specific. This keeps
 each Cog independently installable without requiring a sibling repository at
-runtime. `tests/test_gateway.py` enforces all four copies against whichever
+runtime. `tests/test_gateway.py` enforces all six copies against whichever
 siblings are present, and skips when none are.
 
 SHA-256 of the shared sources, for an integrity check from outside the package:
 
-- `src/turn_runtime.py` — `6171a9b33c6447afd47e7c1a716f893fd307f8e87df737134652aa071527ab93`
+- `src/turn_runtime.py` — `9101fa61feda9e1f18b92ca61b57b83b5211d6f5c2940b2e6013268bd1b3c373`
 - `src/turn_gateway.py` — `69e42639e9377c828ca7a0893916de762849cdc57616aeedea6e78aacf682a16`
-- `tests/test_gateway.py` — `07033aa18cf12333ee61db943e347dd4340ca248341a104400a124d8c84735a1`
+- `tests/test_gateway.py` — `e89cc830557bc7ed7ffaa46b6077a8ec9d557f9d360f7eb8a4c9244c6c66ac99`
 - `tests/test_provider.py` — `e4cc906d2f499d6257f6548326c38241be21519404a3e4e6569f2a558be3e6b0`
 
 Official integration references are in `docs/sources.md`.
@@ -297,3 +297,12 @@ For a local model, use `configuration.locality: local` and a local admitted
 model binding from cog-qwen. The requirement must permit local processing.
 Workbench and the runtime reject a harness whose locality differs from its model.
 Omitting locality preserves the existing cloud configuration default.
+
+## Opt-in provider qualification
+
+See [qualification](docs/qualification.md) for exact model selection, the version/platform matrix, sanitized report format and live authentication and structured-output probes plus local deadline and refusal checks. `qualify` never admits a binding or exports login/model output. It refuses harness-only providers.
+
+Shared qualification sources owned in cog-turn-harness:
+
+- `scripts/qualify_provider.py` — `6f40d76309d267af8e38f4473e6ffa4df61573befb00472328893f2d4f4d5a7d`
+- `tests/test_qualification.py` — `1dfcb7a5ea4d4fc6e44f1a9b3f7f62383ac479fca900b32981be314f39e36056`

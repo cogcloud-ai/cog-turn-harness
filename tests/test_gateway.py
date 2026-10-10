@@ -10,6 +10,7 @@ import copy
 import io
 import json
 import os
+import select
 from pathlib import Path
 import socket
 import sys
@@ -750,11 +751,25 @@ class HalfCloseTests(ServerTestCase):
         return data
     def half_closed_request(self,version):
         """Send a complete request, close the sending direction only, read."""
-        with patch.object(rt,'turn',side_effect=fake_turn({'answer':'delivered'})):
+        closed=threading.Event()
+        handler=self.server.RequestHandlerClass
+        original=handler.client_gone
+        def after_half_close(request):
+            # The server may otherwise finish both probes before shutdown()
+            # runs in the client thread. Exercise actual EOF, not that race.
+            if not closed.wait(2):
+                raise AssertionError('Test client did not half-close.')
+            readable,_,_=select.select([request.connection],[],[],2)
+            if not readable:
+                raise AssertionError('Test half-close did not reach the server.')
+            return original(request)
+        with patch.object(rt,'turn',side_effect=fake_turn({'answer':'delivered'})), \
+             patch.object(handler,'client_gone',after_half_close):
             sock=socket.create_connection(('127.0.0.1',self.port),timeout=20)
             self.addCleanup(sock.close)
             sock.sendall(self.post(self.completion_body(),version=version))
             sock.shutdown(socket.SHUT_WR)
+            closed.set()
             return self.drain(sock)
     def test_an_http_1_1_half_close_is_probed_with_an_interim_response(self):
         """The probe is legitimate for HTTP/1.1: such a client must parse and
@@ -1006,7 +1021,13 @@ class NativeSchemaTests(unittest.TestCase):
 
 class CopyTests(unittest.TestCase):
     SIBLINGS=('cog-claude','cog-chatgpt','cog-turn-harness')
-    SHARED=('src/turn_gateway.py','src/turn_runtime.py','tests/test_gateway.py','tests/test_provider.py')
+    SHARED=('src/turn_gateway.py','src/turn_runtime.py','tests/test_gateway.py','tests/test_provider.py','scripts/qualify_provider.py','tests/test_qualification.py')
+    def test_readme_hashes_match_shared_sources(self):
+        import hashlib
+        text=(ROOT/'README.md').read_text()
+        for name in self.SHARED:
+            self.assertIn('`'+name+'` — `'+hashlib.sha256((ROOT/name).read_bytes()).hexdigest()+'`',text)
+
     def test_shared_sources_are_byte_identical_across_providers(self):
         checked=0
         for name in self.SHARED:

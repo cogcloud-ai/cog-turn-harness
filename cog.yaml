@@ -50,6 +50,10 @@ interfaces:
   kind: command
   task: validate
   audience: lifecycle
+- name: qualify
+  kind: command
+  task: qualify
+  audience: lifecycle
 evaluation:
   tests:
   - tests/test_provider.py
